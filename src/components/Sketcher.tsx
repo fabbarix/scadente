@@ -8,7 +8,14 @@ import {
   Slash,
   Spline,
   Trash2,
+  Lock,
+  Link,
+  Ruler,
+  MoveHorizontal,
+  MoveVertical,
 } from 'lucide-react';
+import { solve, canCreate, arity } from './sketcher/constraints';
+import type { Constraint, ConstraintType, EntityRef } from './sketcher/constraints';
 
 type Pt = { x: number; y: number };
 type Tool = 'select' | 'rect' | 'circle' | 'line' | 'polyline';
@@ -30,7 +37,7 @@ export type { BoolOp as SketcherBoolOp };
 export function opShapesToSketcher(savedShapes: any[]): SketcherShape[] {
   const out: SketcherShape[] = [];
   for (const s of savedShapes) {
-    const id = Math.random().toString(36).slice(2, 11);
+    const id = typeof s.id === 'string' ? s.id : Math.random().toString(36).slice(2, 11);
     const op: BoolOp = s.operation === 'subtract' ? 'subtract' : 'add';
     if (s.type === 'rect') {
       out.push({
@@ -65,9 +72,10 @@ export function opShapesToSketcher(savedShapes: any[]): SketcherShape[] {
 }
 
 interface SketcherProps {
-  onSave: (shapes: any[]) => void;
+  onSave: (shapes: any[], constraints: Constraint[]) => void;
   onCancel: () => void;
   initialShapes?: Shape[];
+  initialConstraints?: Constraint[];
   plane?: {
     preset: 'XY' | 'XZ' | 'YZ' | 'FACE';
     origin: [number, number, number];
@@ -110,8 +118,40 @@ interface SnapTarget {
   kind: SnapKind;
 }
 
-export function Sketcher({ onSave, onCancel, initialShapes = [], plane, referenceOutline }: SketcherProps) {
+export function Sketcher({
+  onSave,
+  onCancel,
+  initialShapes = [],
+  initialConstraints = [],
+  plane,
+  referenceOutline,
+}: SketcherProps) {
   const [shapes, setShapes] = useState<Shape[]>(initialShapes);
+  const [constraints, setConstraints] = useState<Constraint[]>(initialConstraints);
+  const [pendingConstraint, setPendingConstraint] = useState<ConstraintType | null>(null);
+  const [pendingRefs, setPendingRefs] = useState<EntityRef[]>([]);
+  const constraintsRef = useRef(constraints);
+  useEffect(() => {
+    constraintsRef.current = constraints;
+  }, [constraints]);
+
+  // Wrap a setShapes update through the constraint solver. Used by drag and
+  // inline-edit paths so the user's edit is reconciled with the constraint set
+  // before being committed to state.
+  const applyShapes = (
+    next: Shape[] | ((prev: Shape[]) => Shape[]),
+    extraConstraints?: Constraint[]
+  ) => {
+    setShapes((prev) => {
+      const candidate = typeof next === 'function' ? (next as any)(prev) : next;
+      const all = extraConstraints
+        ? [...constraintsRef.current, ...extraConstraints]
+        : constraintsRef.current;
+      if (all.length === 0) return candidate;
+      const result = solve(candidate, all);
+      return result.shapes as Shape[];
+    });
+  };
   const [tool, setTool] = useState<Tool>('select');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draft, setDraft] = useState<Shape | null>(null);
@@ -261,7 +301,111 @@ export function Sketcher({ onSave, onCancel, initialShapes = [], plane, referenc
   };
 
   const updateShape = (id: string, patch: Partial<Shape> | any) => {
-    setShapes((prev) => prev.map((s) => (s.id === id ? ({ ...s, ...patch } as Shape) : s)));
+    applyShapes((prev) => prev.map((s) => (s.id === id ? ({ ...s, ...patch } as Shape) : s)));
+  };
+
+  // ─── Constraint creation flow ──────────────────────────────────────────
+  const beginConstraint = (type: ConstraintType) => {
+    if (pendingConstraint === type) {
+      setPendingConstraint(null);
+      setPendingRefs([]);
+      return;
+    }
+    setPendingConstraint(type);
+    setPendingRefs([]);
+    setTool('select');
+  };
+
+  const newConstraintId = () =>
+    'c_' + Math.random().toString(36).slice(2, 11);
+
+  const finalizeConstraint = (type: ConstraintType, refs: EntityRef[]) => {
+    let next: Constraint | null = null;
+    const id = newConstraintId();
+    if (type === 'horizontal' || type === 'vertical') {
+      next = { id, type, ref: refs[0] };
+    } else if (type === 'fix') {
+      const p = refs[0];
+      // Capture current world position as the fix value.
+      const layoutShape = shapes.find((s) => s.id === p.shapeId);
+      const value = layoutShape ? pointAt(layoutShape, p) : { x: 0, y: 0 };
+      if (p.kind === 'point' && value) next = { id, type: 'fix', ref: p, value };
+    } else if (type === 'coincident') {
+      next = { id, type: 'coincident', a: refs[0], b: refs[1] };
+    } else if (type === 'distance') {
+      const a = refs[0];
+      const b = refs[1];
+      const sa = shapes.find((s) => s.id === a.shapeId);
+      const sb = shapes.find((s) => s.id === b.shapeId);
+      const pa = sa ? pointAt(sa, a) : null;
+      const pb = sb ? pointAt(sb, b) : null;
+      const value = pa && pb ? Math.hypot(pa.x - pb.x, pa.y - pb.y) : 0;
+      next = { id, type: 'distance', a, b, value };
+    }
+    if (next) {
+      setConstraints((prev) => [...prev, next!]);
+      // Re-solve the current shapes against the new constraint set.
+      applyShapes((p) => p, [next]);
+    }
+    setPendingConstraint(null);
+    setPendingRefs([]);
+  };
+
+  // Lookup the world position (in plane-local mm) of a Point ref on a shape.
+  const pointAt = (s: Shape, ref: EntityRef): Pt | null => {
+    if (ref.kind !== 'point') return null;
+    if (s.type === 'line') {
+      if (ref.role === 'p1') return { x: s.x1, y: s.y1 };
+      if (ref.role === 'p2') return { x: s.x2, y: s.y2 };
+    } else if (s.type === 'circle') {
+      if (ref.role === 'center') return { x: s.cx, y: s.cy };
+    } else if (s.type === 'rect') {
+      if (ref.role === 'tl') return { x: s.x, y: s.y + s.height };
+      if (ref.role === 'tr') return { x: s.x + s.width, y: s.y + s.height };
+      if (ref.role === 'br') return { x: s.x + s.width, y: s.y };
+      if (ref.role === 'bl') return { x: s.x, y: s.y };
+      if (ref.role === 'center')
+        return { x: s.x + s.width / 2, y: s.y + s.height / 2 };
+    } else if (s.type === 'polyline' && ref.role === 'vertex' && ref.vertexIdx != null) {
+      return s.points[ref.vertexIdx] ?? null;
+    }
+    return null;
+  };
+
+  // Pick an EntityRef while a constraint is pending. Decides what role the
+  // shape contributes (point, line, etc.) based on the constraint's needs.
+  const pickRefForConstraint = (s: Shape): EntityRef | null => {
+    if (!pendingConstraint) return null;
+    const needsPoint =
+      pendingConstraint === 'fix' ||
+      pendingConstraint === 'coincident' ||
+      pendingConstraint === 'distance';
+    const needsLineish =
+      pendingConstraint === 'horizontal' || pendingConstraint === 'vertical';
+    if (needsLineish) {
+      if (s.type === 'line') return { kind: 'line', shapeId: s.id };
+      // Default rect edge: top
+      if (s.type === 'rect') return { kind: 'edge', shapeId: s.id, edge: 'top' };
+      return null;
+    }
+    if (needsPoint) {
+      if (s.type === 'line') return { kind: 'point', shapeId: s.id, role: 'p1' };
+      if (s.type === 'circle') return { kind: 'point', shapeId: s.id, role: 'center' };
+      if (s.type === 'rect') return { kind: 'point', shapeId: s.id, role: 'tl' };
+      if (s.type === 'polyline')
+        return { kind: 'point', shapeId: s.id, role: 'vertex', vertexIdx: 0 };
+    }
+    return null;
+  };
+
+  const offerRef = (ref: EntityRef) => {
+    if (!pendingConstraint) return;
+    const refs = [...pendingRefs, ref];
+    if (refs.length >= arity(pendingConstraint) && canCreate(pendingConstraint, refs)) {
+      finalizeConstraint(pendingConstraint, refs);
+    } else {
+      setPendingRefs(refs);
+    }
   };
 
   const projectToScreen = (p: Pt) => ({
@@ -333,15 +477,44 @@ export function Sketcher({ onSave, onCancel, initialShapes = [], plane, referenc
       if (cur > 1e-9 && v >= 0) {
         const k = v / cur;
         updateShape(shape.id, { x2: shape.x1 + dx * k, y2: shape.y1 + dy * k });
+        // Persist as a length constraint so subsequent edits respect this value.
+        const ref: EntityRef = { kind: 'line', shapeId: shape.id };
+        upsertLengthConstraint(ref, v);
       }
     } else if (inlineEditor.kind === 'radius' && shape.type === 'circle') {
       updateShape(shape.id, { radius: Math.max(0, v) });
+      // (radius constraint persistence comes in P3)
     } else if (inlineEditor.kind === 'rect-width' && shape.type === 'rect') {
       updateShape(shape.id, { width: Math.max(0, v) });
     } else if (inlineEditor.kind === 'rect-height' && shape.type === 'rect') {
       updateShape(shape.id, { height: Math.max(0, v) });
     }
     setInlineEditor(null);
+  };
+
+  // If a length constraint already exists on this entity, update its value.
+  // Otherwise add a new one. Keeps inline-edits idempotent.
+  const upsertLengthConstraint = (ref: EntityRef, value: number) => {
+    setConstraints((prev) => {
+      const existing = prev.find(
+        (c) => c.type === 'length' && sameRef(c.ref, ref)
+      );
+      if (existing) {
+        return prev.map((c) =>
+          c === existing ? ({ ...c, value } as Constraint) : c
+        );
+      }
+      return [...prev, { id: 'c_' + Math.random().toString(36).slice(2, 11), type: 'length', ref, value } as Constraint];
+    });
+  };
+
+  const sameRef = (a: EntityRef, b: EntityRef): boolean => {
+    if (a.kind !== b.kind || a.shapeId !== b.shapeId) return false;
+    if (a.kind === 'point' && b.kind === 'point') {
+      return a.role === b.role && (a.vertexIdx ?? -1) === (b.vertexIdx ?? -1);
+    }
+    if (a.kind === 'edge' && b.kind === 'edge') return a.edge === b.edge;
+    return true;
   };
 
   const deleteSelected = () => {
@@ -490,7 +663,11 @@ export function Sketcher({ onSave, onCancel, initialShapes = [], plane, referenc
       const tag = (e.target as HTMLElement)?.tagName;
       const inField = tag === 'INPUT' || tag === 'TEXTAREA';
       if (e.key === 'Escape') {
-        if (polyDraft) setPolyDraft(null);
+        if (pendingConstraint) {
+          setPendingConstraint(null);
+          setPendingRefs([]);
+        }
+        else if (polyDraft) setPolyDraft(null);
         else if (draft) setDraft(null);
         else if (selectedId) setSelectedId(null);
         else onCancel();
@@ -510,6 +687,7 @@ export function Sketcher({ onSave, onCancel, initialShapes = [], plane, referenc
     for (const s of shapes) {
       if (s.type === 'rect' && s.width > 0 && s.height > 0) {
         out.push({
+          id: s.id,
           type: 'rect',
           x: s.x + s.width / 2,
           y: s.y + s.height / 2,
@@ -518,13 +696,39 @@ export function Sketcher({ onSave, onCancel, initialShapes = [], plane, referenc
           operation: s.operation,
         });
       } else if (s.type === 'circle' && s.radius > 0) {
-        out.push({ type: 'circle', x: s.cx, y: s.cy, radius: s.radius, operation: s.operation });
+        out.push({ id: s.id, type: 'circle', x: s.cx, y: s.cy, radius: s.radius, operation: s.operation });
       } else if (s.type === 'polyline' && s.closed && s.points.length >= 3) {
-        out.push({ type: 'polygon', points: s.points, operation: s.operation });
+        out.push({ id: s.id, type: 'polygon', points: s.points, operation: s.operation });
       }
       // Open lines / open polylines treated as construction; not extruded.
     }
-    onSave(out);
+    // Constraints reference shape ids that survive the save (any shape we
+    // round-trip — closed shapes — and lines / open polylines too since they
+    // stay live inside the sketcher even though they're not extruded). All
+    // current shape ids are live for this purpose.
+    const liveShapeIds = new Set(shapes.map((s) => s.id));
+    const cleaned = constraints.filter((c) =>
+      refsOf(c).every((r) => liveShapeIds.has(r.shapeId))
+    );
+    onSave(out, cleaned);
+  };
+
+  // Helper: list of refs on a constraint, regardless of shape.
+  const refsOf = (c: Constraint): EntityRef[] => {
+    switch (c.type) {
+      case 'horizontal':
+      case 'vertical':
+      case 'fix':
+      case 'length':
+      case 'radius':
+        return [c.ref];
+      case 'midpoint':
+        return [c.point, c.line];
+      case 'symmetry':
+        return [c.a, c.b, c.axis];
+      default:
+        return [c.a, c.b];
+    }
   };
 
   // ---- Render ----
@@ -583,6 +787,16 @@ export function Sketcher({ onSave, onCancel, initialShapes = [], plane, referenc
     const isSelected = s.id === selectedId;
     const sw = (isSelected ? 2 : 1) / screenScale;
     const select = (e: any) => {
+      if (pendingConstraint) {
+        // Constraint pick mode — use the shape as the next ref instead of
+        // entering normal selection.
+        const ref = pickRefForConstraint(s);
+        if (ref) {
+          e.cancelBubble = true;
+          offerRef(ref);
+        }
+        return;
+      }
       if (tool !== 'select') return;
       e.cancelBubble = true;
       setSelectedId(s.id);
@@ -1010,7 +1224,41 @@ export function Sketcher({ onSave, onCancel, initialShapes = [], plane, referenc
     </button>
   );
 
+  const ConstraintBtn = ({
+    type,
+    icon,
+    label,
+  }: {
+    type: ConstraintType;
+    icon: any;
+    label: string;
+  }) => (
+    <button
+      onClick={() => beginConstraint(type)}
+      className={`p-1.5 rounded-md flex items-center transition-colors ${
+        pendingConstraint === type
+          ? 'bg-amber-600 text-white shadow'
+          : 'text-slate-300 hover:bg-slate-600'
+      }`}
+      title={`${label} constraint`}
+    >
+      {icon}
+    </button>
+  );
+
   const hint = (() => {
+    if (pendingConstraint) {
+      const need = arity(pendingConstraint) - pendingRefs.length;
+      const noun =
+        pendingConstraint === 'horizontal' ||
+        pendingConstraint === 'vertical' ||
+        pendingConstraint === 'length'
+          ? 'line or rect edge'
+          : pendingConstraint === 'radius'
+            ? 'circle'
+            : 'point';
+      return `${pendingConstraint}: pick ${need} more ${noun}${need !== 1 ? 's' : ''}. Esc cancels.`;
+    }
     if (tool === 'rect') return 'Drag to draw a rectangle.';
     if (tool === 'circle') return 'Drag from the center outward.';
     if (tool === 'line') return 'Drag from start to end.';
@@ -1039,6 +1287,13 @@ export function Sketcher({ onSave, onCancel, initialShapes = [], plane, referenc
               <ToolBtn name="circle" icon={<CircleIcon size={14} />} label="Circle" />
               <ToolBtn name="line" icon={<Slash size={14} />} label="Line" />
               <ToolBtn name="polyline" icon={<Spline size={14} />} label="Polyline" />
+            </div>
+            <div className="flex bg-slate-700/50 rounded-md p-1 gap-1">
+              <ConstraintBtn type="horizontal" icon={<MoveHorizontal size={14} />} label="H" />
+              <ConstraintBtn type="vertical" icon={<MoveVertical size={14} />} label="V" />
+              <ConstraintBtn type="fix" icon={<Lock size={14} />} label="Fix" />
+              <ConstraintBtn type="coincident" icon={<Link size={14} />} label="Coincident" />
+              <ConstraintBtn type="distance" icon={<Ruler size={14} />} label="Distance" />
             </div>
             <div className="text-[11px] text-slate-500 truncate hidden md:block">{hint}</div>
           </div>

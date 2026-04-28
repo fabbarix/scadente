@@ -350,6 +350,7 @@ function App() {
   const [sketchReference, setSketchReference] = useState<number[] | null>(null);
   const [editingOpId, setEditingOpId] = useState<string | null>(null);
   const [editingShapes, setEditingShapes] = useState<SketcherShape[] | null>(null);
+  const [editingConstraints, setEditingConstraints] = useState<any[] | null>(null);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [cameraFitTarget, setCameraFitTarget] = useState<CameraFitTarget | null>(null);
   const [cameraFitSignal, setCameraFitSignal] = useState(0);
@@ -567,6 +568,7 @@ function App() {
     setSketchReference(null);
     setEditingOpId(null);
     setEditingShapes(null);
+    setEditingConstraints(null);
   };
 
   const editSketchOp = (op: Operation) => {
@@ -584,6 +586,7 @@ function App() {
     }
     setSketchReference(op.params.referenceOutline ?? null);
     setEditingShapes(opShapesToSketcher(op.params.shapes ?? []));
+    setEditingConstraints(Array.isArray(op.params.constraints) ? op.params.constraints : []);
     setEditingOpId(op.id);
     setSelectedSketchId(null);
     setSelectedFace(null);
@@ -669,7 +672,7 @@ function App() {
     handleBuild(newHistory);
   };
 
-  const handleSaveSketch = (shapes: any[]) => {
+  const handleSaveSketch = (shapes: any[], constraints: any[] = []) => {
     const plane = pickedPlane
       ? { origin: pickedPlane.origin, xDir: pickedPlane.xDir, normal: pickedPlane.normal, preset: pickedPlane.preset }
       : undefined;
@@ -679,7 +682,7 @@ function App() {
       // Update existing op — preserve its depth and plane/referenceOutline.
       newHistory = history.map((op) =>
         op.id === editingOpId
-          ? { ...op, params: { ...op.params, shapes } }
+          ? { ...op, params: { ...op.params, shapes, constraints } }
           : op
       );
       resultId = editingOpId;
@@ -689,6 +692,7 @@ function App() {
         type: 'sketch_extrude',
         params: {
           shapes,
+          constraints,
           depth: 0,
           visible: true, // visible right after sketcher closes; the first
                          // Extrude/Pocket flips this off automatically.
@@ -706,6 +710,7 @@ function App() {
     setSketchReference(null);
     setEditingOpId(null);
     setEditingShapes(null);
+    setEditingConstraints(null);
     setSelectedSketchId(resultId);
     // Re-frame the 3D viewport so the just-saved sketch is centered + visible
     // with margin, ready for the user's next action (extrude, pocket, etc.).
@@ -792,6 +797,7 @@ function App() {
           plane={pickedPlane ?? undefined}
           referenceOutline={sketchReference ?? undefined}
           initialShapes={editingShapes ?? undefined}
+          initialConstraints={editingConstraints ?? undefined}
           onSave={handleSaveSketch}
           onCancel={cancelSketchFlow}
         />
