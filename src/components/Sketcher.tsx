@@ -161,8 +161,17 @@ export function Sketcher({
   const [snapHint, setSnapHint] = useState<SnapTarget | null>(null);
   const [inlineEditor, setInlineEditor] = useState<
     | {
+        target: 'shape';
         shapeId: string;
         kind: 'length' | 'radius' | 'rect-width' | 'rect-height';
+        sx: number;
+        sy: number;
+        value: string;
+      }
+    | {
+        target: 'constraint';
+        constraintId: string;
+        kind: 'distance-value';
         sx: number;
         sy: number;
         value: string;
@@ -487,12 +496,12 @@ export function Sketcher({
     const mid = { x: (s.x1 + s.x2) / 2, y: (s.y1 + s.y2) / 2 };
     const { sx, sy } = projectToScreen(mid);
     const len = dist({ x: s.x1, y: s.y1 }, { x: s.x2, y: s.y2 });
-    setInlineEditor({ shapeId: s.id, kind: 'length', sx, sy, value: len.toFixed(2) });
+    setInlineEditor({ target: 'shape', shapeId: s.id, kind: 'length', sx, sy, value: len.toFixed(2) });
   };
 
   const openRadiusEditor = (s: CircleShape) => {
     const { sx, sy } = projectToScreen({ x: s.cx + s.radius, y: s.cy });
-    setInlineEditor({ shapeId: s.id, kind: 'radius', sx, sy, value: s.radius.toFixed(2) });
+    setInlineEditor({ target: 'shape', shapeId: s.id, kind: 'radius', sx, sy, value: s.radius.toFixed(2) });
   };
 
   // Pick the nearest edge of the rect to the world-space click point and open
@@ -529,14 +538,32 @@ export function Sketcher({
       edgeMid = { x: right, y: s.y + s.height / 2 };
     }
     const { sx, sy } = projectToScreen(edgeMid);
-    setInlineEditor({ shapeId: s.id, kind, sx, sy, value: value.toFixed(2) });
+    setInlineEditor({ target: 'shape', shapeId: s.id, kind, sx, sy, value: value.toFixed(2) });
   };
 
   const commitInlineEditor = () => {
     if (!inlineEditor) return;
     const v = parseFloat(inlineEditor.value);
+    if (!Number.isFinite(v)) {
+      setInlineEditor(null);
+      return;
+    }
+    if (inlineEditor.target === 'constraint') {
+      // Update the targeted distance constraint's value, then resolve. Push
+      // into the ref synchronously so applyShapes sees the new set on the
+      // next render (constraintsRef otherwise updates one tick late).
+      const id = inlineEditor.constraintId;
+      const next = constraints.map((c) =>
+        c.id === id && c.type === 'distance' ? ({ ...c, value: v } as Constraint) : c
+      );
+      setConstraints(next);
+      constraintsRef.current = next;
+      applyShapes((p) => p);
+      setInlineEditor(null);
+      return;
+    }
     const shape = shapes.find((sh) => sh.id === inlineEditor.shapeId);
-    if (!shape || !Number.isFinite(v)) {
+    if (!shape) {
       setInlineEditor(null);
       return;
     }
@@ -1061,6 +1088,172 @@ export function Sketcher({
   };
 
   // Dimension callouts (drawn in unflipped layer, screen coords)
+  // Render dimension graphics for every distance constraint. Drawn in screen
+  // px in the unflipped annotation layer so arrows / text stay sized
+  // consistently regardless of zoom. Geometry is computed in plane-local mm
+  // then projected through `projectToScreen`.
+  const renderDimensions = () => {
+    const out: any[] = [];
+    for (const c of constraints) {
+      if (c.type !== 'distance') continue;
+      // Find rep points (point / line midpoint / edge midpoint / circle center).
+      const repOf = (ref: EntityRef): { x: number; y: number; r?: number } | null => {
+        const s = shapes.find((sh) => sh.id === ref.shapeId);
+        if (!s) return null;
+        if (ref.kind === 'point') return pointAt(s, ref);
+        if (ref.kind === 'line' && s.type === 'line') {
+          return { x: (s.x1 + s.x2) / 2, y: (s.y1 + s.y2) / 2 };
+        }
+        if (ref.kind === 'edge' && s.type === 'rect') {
+          const w = s.width, h = s.height;
+          if (ref.edge === 'top') return { x: s.x + w / 2, y: s.y + h };
+          if (ref.edge === 'bottom') return { x: s.x + w / 2, y: s.y };
+          if (ref.edge === 'left') return { x: s.x, y: s.y + h / 2 };
+          if (ref.edge === 'right') return { x: s.x + w, y: s.y + h / 2 };
+        }
+        if (ref.kind === 'circle' && s.type === 'circle') {
+          return { x: s.cx, y: s.cy, r: s.radius };
+        }
+        return null;
+      };
+      const aP = repOf(c.a);
+      const bP = repOf(c.b);
+      if (!aP || !bP) continue;
+      const dir = c.direction ?? 'auto';
+      let axis: { x: number; y: number };
+      if (dir === 'h') axis = { x: 1, y: 0 };
+      else if (dir === 'v') axis = { x: 0, y: 1 };
+      else {
+        const dx = bP.x - aP.x;
+        const dy = bP.y - aP.y;
+        const L = Math.hypot(dx, dy) || 1;
+        axis = { x: dx / L, y: dy / L };
+      }
+      const perp = { x: -axis.y, y: axis.x };
+      const offset = c.annotation?.offset ?? 5;
+      const labelT = c.annotation?.labelT ?? 0.5;
+      // Projections onto axis / perp.
+      const aAlong = aP.x * axis.x + aP.y * axis.y;
+      const bAlong = bP.x * axis.x + bP.y * axis.y;
+      const aPerp = aP.x * perp.x + aP.y * perp.y;
+      const bPerp = bP.x * perp.x + bP.y * perp.y;
+      const midPerp = (aPerp + bPerp) / 2;
+      const dimPerp = midPerp + offset;
+      // Dim line endpoints (mm).
+      const dimA = {
+        x: aAlong * axis.x + dimPerp * perp.x,
+        y: aAlong * axis.y + dimPerp * perp.y,
+      };
+      const dimB = {
+        x: bAlong * axis.x + dimPerp * perp.x,
+        y: bAlong * axis.y + dimPerp * perp.y,
+      };
+      const labelMm = {
+        x: dimA.x + (dimB.x - dimA.x) * labelT,
+        y: dimA.y + (dimB.y - dimA.y) * labelT,
+      };
+      const sA = projectToScreen(dimA);
+      const sB = projectToScreen(dimB);
+      const sExtA = projectToScreen({ x: aP.x, y: aP.y });
+      const sExtB = projectToScreen({ x: bP.x, y: bP.y });
+      const sLabel = projectToScreen(labelMm);
+      // Arrow direction in screen px (axis projected to screen coords).
+      const adx = sB.sx - sA.sx;
+      const ady = sB.sy - sA.sy;
+      const aLen = Math.hypot(adx, ady) || 1;
+      const ux = adx / aLen;
+      const uy = ady / aLen;
+      const arrow = 6; // px
+      const arrowSpread = 3; // px perpendicular spread
+      const stroke = '#7dd3fc';
+      const widthSel = 1.2;
+      // Extension lines.
+      out.push(
+        <KLine
+          key={`${c.id}-extA`}
+          points={[sExtA.sx, sExtA.sy, sA.sx, sA.sy]}
+          stroke={stroke}
+          strokeWidth={widthSel}
+          dash={[2, 2]}
+          opacity={0.7}
+          listening={false}
+        />,
+        <KLine
+          key={`${c.id}-extB`}
+          points={[sExtB.sx, sExtB.sy, sB.sx, sB.sy]}
+          stroke={stroke}
+          strokeWidth={widthSel}
+          dash={[2, 2]}
+          opacity={0.7}
+          listening={false}
+        />,
+        // Dim line.
+        <KLine
+          key={`${c.id}-dim`}
+          points={[sA.sx, sA.sy, sB.sx, sB.sy]}
+          stroke={stroke}
+          strokeWidth={widthSel}
+          listening={false}
+        />,
+        // Arrowhead at A (pointing away from B → backward along u).
+        <KLine
+          key={`${c.id}-arrA`}
+          points={[
+            sA.sx + ux * arrow + uy * arrowSpread,
+            sA.sy + uy * arrow - ux * arrowSpread,
+            sA.sx,
+            sA.sy,
+            sA.sx + ux * arrow - uy * arrowSpread,
+            sA.sy + uy * arrow + ux * arrowSpread,
+          ]}
+          stroke={stroke}
+          strokeWidth={widthSel}
+          listening={false}
+        />,
+        // Arrowhead at B.
+        <KLine
+          key={`${c.id}-arrB`}
+          points={[
+            sB.sx - ux * arrow + uy * arrowSpread,
+            sB.sy - uy * arrow - ux * arrowSpread,
+            sB.sx,
+            sB.sy,
+            sB.sx - ux * arrow - uy * arrowSpread,
+            sB.sy - uy * arrow + ux * arrowSpread,
+          ]}
+          stroke={stroke}
+          strokeWidth={widthSel}
+          listening={false}
+        />,
+        // Value label — clickable / dbl-clickable.
+        <Text
+          key={`${c.id}-label`}
+          x={sLabel.sx + 4}
+          y={sLabel.sy - 7}
+          text={`${c.value.toFixed(1)} mm`}
+          fontSize={11}
+          fontFamily="ui-monospace, monospace"
+          fill={stroke}
+          onDblClick={(e: any) => {
+            e.cancelBubble = true;
+            setInlineEditor({
+              target: 'constraint',
+              constraintId: c.id,
+              kind: 'distance-value',
+              sx: sLabel.sx,
+              sy: sLabel.sy,
+              value: c.value.toFixed(2),
+            });
+          }}
+          onTap={(e: any) => {
+            e.cancelBubble = true;
+          }}
+        />
+      );
+    }
+    return out;
+  };
+
   const renderCallouts = () => {
     if (!selectedShape) return null;
     const s = selectedShape;
@@ -1414,6 +1607,10 @@ export function Sketcher({
                 {renderDraftCallout()}
                 {renderPolyDraftCallout()}
               </Layer>
+              {/* Listening layer for dimension graphics (label dbl-click → edit value). */}
+              <Layer>
+                {renderDimensions()}
+              </Layer>
             </Stage>
             {inlineEditor && (
               <div
@@ -1432,7 +1629,9 @@ export function Sketcher({
                         ? 'R'
                         : inlineEditor.kind === 'rect-width'
                           ? 'W'
-                          : 'H'}
+                          : inlineEditor.kind === 'rect-height'
+                            ? 'H'
+                            : 'D'}
                   </span>
                   <input
                     type="number"
