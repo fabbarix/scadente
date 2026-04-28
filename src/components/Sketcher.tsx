@@ -335,12 +335,8 @@ export function Sketcher({
     } else if (type === 'distance') {
       const a = refs[0];
       const b = refs[1];
-      const sa = shapes.find((s) => s.id === a.shapeId);
-      const sb = shapes.find((s) => s.id === b.shapeId);
-      const pa = sa ? pointAt(sa, a) : null;
-      const pb = sb ? pointAt(sb, b) : null;
-      const value = pa && pb ? Math.hypot(pa.x - pb.x, pa.y - pb.y) : 0;
-      next = { id, type: 'distance', a, b, value };
+      const value = currentDistanceBetween(a, b);
+      next = { id, type: 'distance', a, b, value, direction: 'auto' };
     }
     if (next) {
       setConstraints((prev) => [...prev, next!]);
@@ -349,6 +345,73 @@ export function Sketcher({
     }
     setPendingConstraint(null);
     setPendingRefs([]);
+  };
+
+  // Compute the current geometric distance between two entity refs. Mirrors
+  // the solver's residual logic: line refs use perpendicular distance from
+  // the other entity, circle refs subtract their radius, points are direct.
+  const currentDistanceBetween = (a: EntityRef, b: EntityRef): number => {
+    const repOf = (ref: EntityRef): { x: number; y: number; r?: number } | null => {
+      const s = shapes.find((sh) => sh.id === ref.shapeId);
+      if (!s) return null;
+      if (ref.kind === 'point') return pointAt(s, ref);
+      if (ref.kind === 'line' && s.type === 'line') {
+        return { x: (s.x1 + s.x2) / 2, y: (s.y1 + s.y2) / 2 };
+      }
+      if (ref.kind === 'edge' && s.type === 'rect') {
+        const w = s.width, h = s.height;
+        if (ref.edge === 'top') return { x: s.x + w / 2, y: s.y + h };
+        if (ref.edge === 'bottom') return { x: s.x + w / 2, y: s.y };
+        if (ref.edge === 'left') return { x: s.x, y: s.y + h / 2 };
+        if (ref.edge === 'right') return { x: s.x + w, y: s.y + h / 2 };
+      }
+      if (ref.kind === 'circle' && s.type === 'circle') {
+        return { x: s.cx, y: s.cy, r: s.radius };
+      }
+      return null;
+    };
+    const lineEnds = (ref: EntityRef): { p1: Pt; p2: Pt } | null => {
+      const s = shapes.find((sh) => sh.id === ref.shapeId);
+      if (!s) return null;
+      if (ref.kind === 'line' && s.type === 'line') {
+        return { p1: { x: s.x1, y: s.y1 }, p2: { x: s.x2, y: s.y2 } };
+      }
+      if (ref.kind === 'edge' && s.type === 'rect') {
+        const w = s.width, h = s.height;
+        if (ref.edge === 'top') return { p1: { x: s.x, y: s.y + h }, p2: { x: s.x + w, y: s.y + h } };
+        if (ref.edge === 'bottom') return { p1: { x: s.x, y: s.y }, p2: { x: s.x + w, y: s.y } };
+        if (ref.edge === 'left') return { p1: { x: s.x, y: s.y }, p2: { x: s.x, y: s.y + h } };
+        if (ref.edge === 'right') return { p1: { x: s.x + w, y: s.y }, p2: { x: s.x + w, y: s.y + h } };
+      }
+      return null;
+    };
+    const pa = repOf(a);
+    const pb = repOf(b);
+    if (!pa || !pb) return 0;
+    let dist: number;
+    const aIsLine = a.kind === 'line' || a.kind === 'edge';
+    const bIsLine = b.kind === 'line' || b.kind === 'edge';
+    if (aIsLine) {
+      const line = lineEnds(a);
+      if (line) {
+        const dx = line.p2.x - line.p1.x;
+        const dy = line.p2.y - line.p1.y;
+        const len = Math.hypot(dx, dy) || 1;
+        dist = Math.abs(((pb.x - line.p1.x) * dy - (pb.y - line.p1.y) * dx) / len);
+      } else dist = Math.hypot(pa.x - pb.x, pa.y - pb.y);
+    } else if (bIsLine) {
+      const line = lineEnds(b);
+      if (line) {
+        const dx = line.p2.x - line.p1.x;
+        const dy = line.p2.y - line.p1.y;
+        const len = Math.hypot(dx, dy) || 1;
+        dist = Math.abs(((pa.x - line.p1.x) * dy - (pa.y - line.p1.y) * dx) / len);
+      } else dist = Math.hypot(pa.x - pb.x, pa.y - pb.y);
+    } else {
+      dist = Math.hypot(pa.x - pb.x, pa.y - pb.y);
+    }
+    const radiusOffset = (pa.r ?? 0) + (pb.r ?? 0);
+    return Math.max(0, dist - radiusOffset);
   };
 
   // Lookup the world position (in plane-local mm) of a Point ref on a shape.
@@ -373,18 +436,25 @@ export function Sketcher({
   };
 
   // Pick an EntityRef while a constraint is pending. Decides what role the
-  // shape contributes (point, line, etc.) based on the constraint's needs.
+  // shape contributes (point, line, circle, edge) based on the constraint's
+  // needs.
   const pickRefForConstraint = (s: Shape): EntityRef | null => {
     if (!pendingConstraint) return null;
-    const needsPoint =
-      pendingConstraint === 'fix' ||
-      pendingConstraint === 'coincident' ||
-      pendingConstraint === 'distance';
     const needsLineish =
       pendingConstraint === 'horizontal' || pendingConstraint === 'vertical';
+    const needsPoint =
+      pendingConstraint === 'fix' || pendingConstraint === 'coincident';
+    // Distance accepts whatever the user clicks: point / line / edge / circle.
+    if (pendingConstraint === 'distance') {
+      if (s.type === 'line') return { kind: 'line', shapeId: s.id };
+      if (s.type === 'circle') return { kind: 'circle', shapeId: s.id };
+      if (s.type === 'rect') return { kind: 'edge', shapeId: s.id, edge: 'top' };
+      if (s.type === 'polyline')
+        return { kind: 'point', shapeId: s.id, role: 'vertex', vertexIdx: 0 };
+      return null;
+    }
     if (needsLineish) {
       if (s.type === 'line') return { kind: 'line', shapeId: s.id };
-      // Default rect edge: top
       if (s.type === 'rect') return { kind: 'edge', shapeId: s.id, edge: 'top' };
       return null;
     }

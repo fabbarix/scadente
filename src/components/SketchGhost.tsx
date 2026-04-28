@@ -15,11 +15,12 @@ export interface SketchData {
 interface Props {
   sketch: SketchData;
   selected: boolean;
+  visible: boolean;
   onSelect: () => void;
   onDepthCommit: (depth: number) => void;
 }
 
-export function SketchGhost({ sketch, selected, onSelect, onDepthCommit }: Props) {
+export function SketchGhost({ sketch, visible, selected, onSelect, onDepthCommit }: Props) {
   const meshRef = useRef<THREE.Mesh>(null);
   const linesRef = useRef<THREE.LineSegments>(null);
   const [handleObj, setHandleObj] = useState<THREE.Group | null>(null);
@@ -82,29 +83,35 @@ export function SketchGhost({ sketch, selected, onSelect, onDepthCommit }: Props
 
   return (
     <>
-      <mesh
-        ref={meshRef}
-        onClick={(e) => {
-          e.stopPropagation();
-          onSelect();
-        }}
-        onPointerOver={(e) => (e.object.userData.hovered = true)}
-        onPointerOut={(e) => (e.object.userData.hovered = false)}
-      >
-        <meshBasicMaterial
-          color={ghostColor}
-          transparent
-          opacity={ghostOpacity}
-          side={THREE.DoubleSide}
-          depthWrite={false}
-        />
-      </mesh>
-      <lineSegments ref={linesRef}>
-        <lineBasicMaterial color={edgeColor} transparent opacity={0.9} />
-      </lineSegments>
+      {visible && (
+        <>
+          <mesh
+            ref={meshRef}
+            onClick={(e) => {
+              e.stopPropagation();
+              onSelect();
+            }}
+            onPointerOver={(e) => (e.object.userData.hovered = true)}
+            onPointerOut={(e) => (e.object.userData.hovered = false)}
+          >
+            <meshBasicMaterial
+              color={ghostColor}
+              transparent
+              opacity={ghostOpacity}
+              side={THREE.DoubleSide}
+              depthWrite={false}
+            />
+          </mesh>
+          <lineSegments ref={linesRef}>
+            <lineBasicMaterial color={edgeColor} transparent opacity={0.9} />
+          </lineSegments>
+        </>
+      )}
 
       {/* Selected: an empty group at planeOrigin, oriented so its local +Z points along the plane normal.
-          drei's <TransformControls> will draw and drive the only handle (the blue Z arrow). */}
+          drei's <TransformControls> will draw and drive the only handle (the blue Z arrow).
+          Stays mounted while selected even when the ghost mesh is hidden so a mid-drag
+          auto-hide doesn't tear down the pointer-captured TransformControls. */}
       {selected && (
         <group position={sketch.planeOrigin} quaternion={planeQuat}>
           <group ref={setHandleObj as any} />

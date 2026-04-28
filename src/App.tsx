@@ -38,18 +38,90 @@ interface EdgeMeta {
   vertexCount: number;
 }
 
+type PickHit =
+  | { kind: 'edge'; meta: EdgeMeta }
+  | { kind: 'face'; meta: FaceMeta };
+
+/**
+ * Resolve a click / hover against the model. Two rules:
+ *
+ *   1. Edges that sit behind a face are not pickable. We find the closest
+ *      front-face hit and filter out any line whose `distance` is more than
+ *      `OCCLUSION_TOLERANCE_MM` past it. The tolerance is needed because line
+ *      hits use `Line.threshold` and may report a slightly different distance
+ *      than the face the line actually lies on.
+ *   2. Among the remaining (visible) line hits, the one closest to the cursor
+ *      in screen space wins — that's `distanceToRay`, the perpendicular
+ *      distance from the ray to the segment. This makes near-corner picks
+ *      decisive: whichever edge the cursor is actually hovering over wins.
+ *
+ * If no visible line is hit, fall back to the closest face hit.
+ */
+const OCCLUSION_TOLERANCE_MM = 2;
+
+const pickFromIntersections = (
+  intersections: any[],
+  meshObj: any,
+  linesObj: any,
+  edgeMeta: Record<number, EdgeMeta>,
+  faceMeta: Record<number, FaceMeta>
+): PickHit | null => {
+  // Closest face along the ray — anything farther than this (plus tolerance)
+  // is occluded by the model surface.
+  let frontFaceDist = Infinity;
+  let bestFace: any = null;
+  for (const it of intersections) {
+    if (it.object === meshObj && typeof it.faceIndex === 'number') {
+      if (it.distance < frontFaceDist) {
+        frontFaceDist = it.distance;
+        bestFace = it;
+      }
+    }
+  }
+
+  let bestLine: any = null;
+  for (const it of intersections) {
+    if (it.object !== linesObj || typeof it.index !== 'number') continue;
+    if (it.distance > frontFaceDist + OCCLUSION_TOLERANCE_MM) continue;
+    const dr = typeof it.distanceToRay === 'number' ? it.distanceToRay : 0;
+    const bestDr = bestLine
+      ? typeof bestLine.distanceToRay === 'number'
+        ? bestLine.distanceToRay
+        : 0
+      : Infinity;
+    if (dr < bestDr) bestLine = it;
+  }
+  if (bestLine) {
+    const idx = bestLine.index;
+    const eMeta = Object.values(edgeMeta).find(
+      (m) => idx >= m.vertexStart && idx < m.vertexStart + m.vertexCount
+    );
+    if (eMeta) return { kind: 'edge', meta: eMeta };
+  }
+  if (bestFace) {
+    const tStart = bestFace.faceIndex * 3;
+    const fMeta = Object.values(faceMeta).find(
+      (m) => tStart >= m.triangleStart && tStart < m.triangleStart + m.triangleCount
+    );
+    if (fMeta) return { kind: 'face', meta: fMeta };
+  }
+  return null;
+};
+
 function Viewport({
   meshData,
   faceMeta,
   edgeMeta,
   onFaceSelected,
   onEdgeSelected,
+  onHoverEdge,
 }: {
   meshData: any;
   faceMeta: Record<number, FaceMeta>;
   edgeMeta: Record<number, EdgeMeta>;
   onFaceSelected: (face: FaceMeta | null) => void;
   onEdgeSelected: (edgeId: number, additive: boolean) => void;
+  onHoverEdge: (edgeId: number | null) => void;
 }) {
   const meshRef = useRef<THREE.Mesh>(null);
   const linesRef = useRef<THREE.LineSegments>(null);
@@ -92,47 +164,22 @@ function Viewport({
     <>
       <group
         onClick={(e) => {
-          // Walk all hits and prefer a line when one is found at near-equal
-          // distance to the closest face — three.js can't break depth ties when
-          // an edge sits exactly on a face boundary (the rim of a pocket, for
-          // instance), so we tilt the resolution toward edges so they're
-          // pickable through the face under the cursor.
-          let lineHit: any = null;
-          let faceHit: any = null;
-          for (const it of e.intersections) {
-            if (!lineHit && it.object === linesRef.current) lineHit = it;
-            else if (!faceHit && it.object === meshRef.current) faceHit = it;
-            if (lineHit && faceHit) break;
-          }
-          if (!lineHit && !faceHit) return;
-
-          const preferLine =
-            lineHit && (!faceHit || lineHit.distance <= faceHit.distance + 1.0);
-          if (preferLine) {
-            const idx = lineHit.index;
-            if (idx == null) return;
-            const meta = Object.values(edgeMeta).find(
-              (m) => idx >= m.vertexStart && idx < m.vertexStart + m.vertexCount
-            );
-            if (meta) {
-              e.stopPropagation();
-              onEdgeSelected(meta.edgeId, e.shiftKey || e.metaKey || e.ctrlKey);
-            }
-            return;
-          }
-          if (faceHit) {
-            const fIdx = faceHit.faceIndex;
-            if (fIdx == null) return;
-            const tStart = fIdx * 3;
-            const meta = Object.values(faceMeta).find(
-              (m) => tStart >= m.triangleStart && tStart < m.triangleStart + m.triangleCount
-            );
-            if (meta) {
-              e.stopPropagation();
-              onFaceSelected(meta);
-            }
+          const hit = pickFromIntersections(e.intersections, meshRef.current, linesRef.current, edgeMeta, faceMeta);
+          if (!hit) return;
+          if (hit.kind === 'edge') {
+            e.stopPropagation();
+            onEdgeSelected(hit.meta.edgeId, e.shiftKey || e.metaKey || e.ctrlKey);
+          } else {
+            e.stopPropagation();
+            onFaceSelected(hit.meta);
           }
         }}
+        onPointerMove={(e) => {
+          const hit = pickFromIntersections(e.intersections, meshRef.current, linesRef.current, edgeMeta, faceMeta);
+          if (hit && hit.kind === 'edge') onHoverEdge(hit.meta.edgeId);
+          else onHoverEdge(null);
+        }}
+        onPointerOut={() => onHoverEdge(null)}
       >
         <mesh ref={meshRef}>
           <meshStandardMaterial color="#3b82f6" side={THREE.DoubleSide} polygonOffset polygonOffsetFactor={1} polygonOffsetUnits={1} />
@@ -331,6 +378,45 @@ function EdgeHighlight({
   );
 }
 
+/**
+ * Hover preview: render the single edge the user would select if they
+ * clicked right now. Same geometry plumbing as EdgeHighlight but a single
+ * id and a less-saturated color so it visually reads as "preview".
+ */
+function EdgeHover({
+  edges,
+  edgeMeta,
+  edgeId,
+}: {
+  edges: any;
+  edgeMeta: Record<number, EdgeMeta>;
+  edgeId: number;
+}) {
+  const ref = useRef<THREE.LineSegments>(null);
+  useEffect(() => {
+    if (!ref.current) return;
+    const meta = edgeMeta[edgeId];
+    if (!edges?.lines || !meta) {
+      ref.current.geometry = new THREE.BufferGeometry();
+      return;
+    }
+    const lines: number[] = edges.lines;
+    const positions: number[] = [];
+    for (let i = meta.vertexStart; i < meta.vertexStart + meta.vertexCount; i++) {
+      positions.push(lines[i * 3], lines[i * 3 + 1], lines[i * 3 + 2]);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+    g.computeBoundingSphere();
+    ref.current.geometry = g;
+  }, [edges, edgeMeta, edgeId]);
+  return (
+    <lineSegments ref={ref} renderOrder={550}>
+      <lineBasicMaterial color="#7dd3fc" linewidth={2} depthTest={false} transparent opacity={0.85} />
+    </lineSegments>
+  );
+}
+
 function App() {
   const [history, setHistory] = useState<Operation[]>([]);
   const [meshData, setMeshData] = useState<any>(null);
@@ -340,6 +426,7 @@ function App() {
   const [selectedFace, setSelectedFace] = useState<FaceMeta | null>(null);
   const [edgeMeta, setEdgeMeta] = useState<Record<number, EdgeMeta>>({});
   const [selectedEdgeIds, setSelectedEdgeIds] = useState<number[]>([]);
+  const [hoveredEdgeId, setHoveredEdgeId] = useState<number | null>(null);
   const [filletValue, setFilletValue] = useState<number>(2);
   const [isWorkerReady, setIsWorkerReady] = useState(false);
 
@@ -1091,19 +1178,28 @@ function App() {
               setSelectedEdgeIds([]);
             }}
             onEdgeSelected={handleEdgeSelected}
+            onHoverEdge={setHoveredEdgeId}
           />
           <FaceHighlight meshData={meshData} faceId={selectedFace?.faceId ?? null} />
           <EdgeHighlight edges={meshData?.edges} edgeMeta={edgeMeta} selectedEdgeIds={selectedEdgeIds} />
+          {hoveredEdgeId != null && !selectedEdgeIds.includes(hoveredEdgeId) && (
+            <EdgeHover edges={meshData?.edges} edgeMeta={edgeMeta} edgeId={hoveredEdgeId} />
+          )}
           {mode === 'idle' &&
             sketches.map((s) => {
               const op = history.find((o) => o.id === s.id);
               const visible = op?.params.visible === true;
-              if (!visible) return null;
+              const selected = s.id === selectedSketchId;
+              // Render even when hidden as long as the user could be interacting
+              // with this sketch's depth handle — unmounting mid-drag would tear
+              // down the TransformControls and break the pointer capture.
+              if (!visible && !selected) return null;
               return (
                 <SketchGhost
                   key={s.id}
                   sketch={s}
-                  selected={s.id === selectedSketchId}
+                  visible={visible}
+                  selected={selected}
                   onSelect={() => {
                     setSelectedSketchId(s.id);
                     setSelectedFace(null);
