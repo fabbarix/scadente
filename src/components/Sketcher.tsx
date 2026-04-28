@@ -130,13 +130,20 @@ export function Sketcher({
   const [constraints, setConstraints] = useState<Constraint[]>(initialConstraints);
   const [pendingConstraint, setPendingConstraint] = useState<ConstraintType | null>(null);
   const [pendingRefs, setPendingRefs] = useState<EntityRef[]>([]);
-  // Direction lock for an in-progress distance constraint pick. 'auto' = follow
-  // mouse motion; 'h' / 'v' = locked via H / V key.
-  const [pendingDistanceDir, setPendingDistanceDir] = useState<'auto' | 'h' | 'v'>('auto');
-  // First-pick anchor (in mm) — used to detect provisional H / V direction
-  // from mouse motion before the user commits the second pick.
-  const pendingAnchorRef = useRef<Pt | null>(null);
+  const [pendingHint, setPendingHint] = useState<string | null>(null);
+  const pendingHintTimer = useRef<number | null>(null);
   const lastCursorMmRef = useRef<Pt | null>(null);
+
+  const flashHint = (msg: string) => {
+    setPendingHint(msg);
+    if (pendingHintTimer.current != null) {
+      window.clearTimeout(pendingHintTimer.current);
+    }
+    pendingHintTimer.current = window.setTimeout(() => {
+      setPendingHint(null);
+      pendingHintTimer.current = null;
+    }, 3500);
+  };
   // Active drag of a dimension graphic (dim line offset or label labelT).
   const [dimDrag, setDimDrag] = useState<
     | {
@@ -365,9 +372,15 @@ export function Sketcher({
     } else if (type === 'distance') {
       const a = refs[0];
       const b = refs[1];
-      const direction = resolvePendingDistanceDirection();
-      const value = currentSignedDistance(a, b, direction);
-      next = { id, type: 'distance', a, b, value, direction };
+      // Reject if the chosen line/edge pair isn't parallel.
+      if (!areParallel(a, b)) {
+        flashHint('Lines must be parallel — add a parallel constraint first.');
+        setPendingConstraint(null);
+        setPendingRefs([]);
+        return;
+      }
+      const value = currentDistanceBetween(a, b);
+      next = { id, type: 'distance', a, b, value, annotation: { offset: 5, labelT: 0.5 } };
     }
     if (next) {
       setConstraints((prev) => [...prev, next!]);
@@ -376,123 +389,86 @@ export function Sketcher({
     }
     setPendingConstraint(null);
     setPendingRefs([]);
-    setPendingDistanceDir('auto');
-    pendingAnchorRef.current = null;
   };
 
-  // Resolve direction for a fresh distance constraint:
-  //   - explicit lock (H / V key) wins
-  //   - otherwise compare cursor motion since the first pick: if the move is
-  //     ≥1.5× more horizontal than vertical (or vice-versa) we lock to that
-  //     axis; mostly-diagonal motion stays 'auto'
-  const resolvePendingDistanceDirection = (): 'auto' | 'h' | 'v' => {
-    if (pendingDistanceDir !== 'auto') return pendingDistanceDir;
-    const anchor = pendingAnchorRef.current;
-    const cur = lastCursorMmRef.current;
-    if (!anchor || !cur) return 'auto';
-    const dx = Math.abs(cur.x - anchor.x);
-    const dy = Math.abs(cur.y - anchor.y);
-    if (dx > dy * 1.5) return 'h';
-    if (dy > dx * 1.5) return 'v';
-    return 'auto';
+  const nearestRectEdge = (
+    r: { x: number; y: number; width: number; height: number },
+    p: Pt
+  ): 'top' | 'bottom' | 'left' | 'right' => {
+    const dTop = Math.abs(p.y - (r.y + r.height));
+    const dBot = Math.abs(p.y - r.y);
+    const dLeft = Math.abs(p.x - r.x);
+    const dRight = Math.abs(p.x - (r.x + r.width));
+    const m = Math.min(dTop, dBot, dLeft, dRight);
+    if (m === dTop) return 'top';
+    if (m === dBot) return 'bottom';
+    if (m === dLeft) return 'left';
+    return 'right';
   };
 
-  // Compute the current signed component distance for h/v, or unsigned
-  // geometric distance for auto. Used as the initial value of a fresh
-  // distance constraint so the solver doesn't snap geometry to 0.
-  const currentSignedDistance = (a: EntityRef, b: EntityRef, dir: 'auto' | 'h' | 'v'): number => {
-    const repOf = (ref: EntityRef): { x: number; y: number; r?: number } | null => {
-      const s = shapes.find((sh) => sh.id === ref.shapeId);
-      if (!s) return null;
-      if (ref.kind === 'point') return pointAt(s, ref);
-      if (ref.kind === 'line' && s.type === 'line') {
-        return { x: (s.x1 + s.x2) / 2, y: (s.y1 + s.y2) / 2 };
-      }
-      if (ref.kind === 'edge' && s.type === 'rect') {
-        const w = s.width, h = s.height;
-        if (ref.edge === 'top') return { x: s.x + w / 2, y: s.y + h };
-        if (ref.edge === 'bottom') return { x: s.x + w / 2, y: s.y };
-        if (ref.edge === 'left') return { x: s.x, y: s.y + h / 2 };
-        if (ref.edge === 'right') return { x: s.x + w, y: s.y + h / 2 };
-      }
-      if (ref.kind === 'circle' && s.type === 'circle') {
-        return { x: s.cx, y: s.cy, r: s.radius };
-      }
-      return null;
-    };
-    const pa = repOf(a);
-    const pb = repOf(b);
-    if (!pa || !pb) return 0;
-    if (dir === 'h') return pb.x - pa.x;
-    if (dir === 'v') return pb.y - pa.y;
-    return currentDistanceBetween(a, b);
+  // Direction vector of a line / rect-edge in plane-local mm. Used for
+  // parallelism checks and for orienting the dim graphic.
+  const lineDirection = (ref: EntityRef): Pt | null => {
+    const s = shapes.find((sh) => sh.id === ref.shapeId);
+    if (!s) return null;
+    if (ref.kind === 'line' && s.type === 'line') {
+      const dx = s.x2 - s.x1;
+      const dy = s.y2 - s.y1;
+      const L = Math.hypot(dx, dy);
+      if (L < 1e-6) return null;
+      return { x: dx / L, y: dy / L };
+    }
+    if (ref.kind === 'edge' && s.type === 'rect') {
+      if (ref.edge === 'top' || ref.edge === 'bottom') return { x: 1, y: 0 };
+      return { x: 0, y: 1 };
+    }
+    return null;
+  };
+
+  // Two line / rect-edge refs are parallel when their direction vectors have
+  // a near-zero cross-product (within ~0.6°).
+  const areParallel = (a: EntityRef, b: EntityRef): boolean => {
+    const da = lineDirection(a);
+    const db = lineDirection(b);
+    if (!da || !db) return false;
+    return Math.abs(da.x * db.y - da.y * db.x) < 0.01;
+  };
+
+  // Endpoints of a line / rect-edge in plane-local mm.
+  const lineEndsOf = (ref: EntityRef): { p1: Pt; p2: Pt } | null => {
+    const s = shapes.find((sh) => sh.id === ref.shapeId);
+    if (!s) return null;
+    if (ref.kind === 'line' && s.type === 'line') {
+      return { p1: { x: s.x1, y: s.y1 }, p2: { x: s.x2, y: s.y2 } };
+    }
+    if (ref.kind === 'edge' && s.type === 'rect') {
+      const w = s.width, h = s.height;
+      if (ref.edge === 'top') return { p1: { x: s.x, y: s.y + h }, p2: { x: s.x + w, y: s.y + h } };
+      if (ref.edge === 'bottom') return { p1: { x: s.x, y: s.y }, p2: { x: s.x + w, y: s.y } };
+      if (ref.edge === 'left') return { p1: { x: s.x, y: s.y }, p2: { x: s.x, y: s.y + h } };
+      if (ref.edge === 'right') return { p1: { x: s.x + w, y: s.y }, p2: { x: s.x + w, y: s.y + h } };
+    }
+    return null;
   };
 
   // Compute the current geometric distance between two entity refs. Mirrors
   // the solver's residual logic: line refs use perpendicular distance from
   // the other entity, circle refs subtract their radius, points are direct.
+  // Perpendicular distance between two parallel line / rect-edge entities,
+  // measured from a's midpoint to b. Used as the initial value of a fresh
+  // distance constraint so the solver doesn't snap geometry to 0.
   const currentDistanceBetween = (a: EntityRef, b: EntityRef): number => {
-    const repOf = (ref: EntityRef): { x: number; y: number; r?: number } | null => {
-      const s = shapes.find((sh) => sh.id === ref.shapeId);
-      if (!s) return null;
-      if (ref.kind === 'point') return pointAt(s, ref);
-      if (ref.kind === 'line' && s.type === 'line') {
-        return { x: (s.x1 + s.x2) / 2, y: (s.y1 + s.y2) / 2 };
-      }
-      if (ref.kind === 'edge' && s.type === 'rect') {
-        const w = s.width, h = s.height;
-        if (ref.edge === 'top') return { x: s.x + w / 2, y: s.y + h };
-        if (ref.edge === 'bottom') return { x: s.x + w / 2, y: s.y };
-        if (ref.edge === 'left') return { x: s.x, y: s.y + h / 2 };
-        if (ref.edge === 'right') return { x: s.x + w, y: s.y + h / 2 };
-      }
-      if (ref.kind === 'circle' && s.type === 'circle') {
-        return { x: s.cx, y: s.cy, r: s.radius };
-      }
-      return null;
+    const lineA = lineEndsOf(a);
+    const lineB = lineEndsOf(b);
+    if (!lineA || !lineB) return 0;
+    const midA = {
+      x: (lineA.p1.x + lineA.p2.x) / 2,
+      y: (lineA.p1.y + lineA.p2.y) / 2,
     };
-    const lineEnds = (ref: EntityRef): { p1: Pt; p2: Pt } | null => {
-      const s = shapes.find((sh) => sh.id === ref.shapeId);
-      if (!s) return null;
-      if (ref.kind === 'line' && s.type === 'line') {
-        return { p1: { x: s.x1, y: s.y1 }, p2: { x: s.x2, y: s.y2 } };
-      }
-      if (ref.kind === 'edge' && s.type === 'rect') {
-        const w = s.width, h = s.height;
-        if (ref.edge === 'top') return { p1: { x: s.x, y: s.y + h }, p2: { x: s.x + w, y: s.y + h } };
-        if (ref.edge === 'bottom') return { p1: { x: s.x, y: s.y }, p2: { x: s.x + w, y: s.y } };
-        if (ref.edge === 'left') return { p1: { x: s.x, y: s.y }, p2: { x: s.x, y: s.y + h } };
-        if (ref.edge === 'right') return { p1: { x: s.x + w, y: s.y }, p2: { x: s.x + w, y: s.y + h } };
-      }
-      return null;
-    };
-    const pa = repOf(a);
-    const pb = repOf(b);
-    if (!pa || !pb) return 0;
-    let dist: number;
-    const aIsLine = a.kind === 'line' || a.kind === 'edge';
-    const bIsLine = b.kind === 'line' || b.kind === 'edge';
-    if (aIsLine) {
-      const line = lineEnds(a);
-      if (line) {
-        const dx = line.p2.x - line.p1.x;
-        const dy = line.p2.y - line.p1.y;
-        const len = Math.hypot(dx, dy) || 1;
-        dist = Math.abs(((pb.x - line.p1.x) * dy - (pb.y - line.p1.y) * dx) / len);
-      } else dist = Math.hypot(pa.x - pb.x, pa.y - pb.y);
-    } else if (bIsLine) {
-      const line = lineEnds(b);
-      if (line) {
-        const dx = line.p2.x - line.p1.x;
-        const dy = line.p2.y - line.p1.y;
-        const len = Math.hypot(dx, dy) || 1;
-        dist = Math.abs(((pa.x - line.p1.x) * dy - (pa.y - line.p1.y) * dx) / len);
-      } else dist = Math.hypot(pa.x - pb.x, pa.y - pb.y);
-    } else {
-      dist = Math.hypot(pa.x - pb.x, pa.y - pb.y);
-    }
-    const radiusOffset = (pa.r ?? 0) + (pb.r ?? 0);
-    return Math.max(0, dist - radiusOffset);
+    const dx = lineB.p2.x - lineB.p1.x;
+    const dy = lineB.p2.y - lineB.p1.y;
+    const len = Math.hypot(dx, dy) || 1;
+    return Math.abs(((midA.x - lineB.p1.x) * dy - (midA.y - lineB.p1.y) * dx) / len);
   };
 
   // Lookup the world position (in plane-local mm) of a Point ref on a shape.
@@ -519,24 +495,24 @@ export function Sketcher({
   // Pick an EntityRef while a constraint is pending. Decides what role the
   // shape contributes (point, line, circle, edge) based on the constraint's
   // needs.
-  const pickRefForConstraint = (s: Shape): EntityRef | null => {
+  const pickRefForConstraint = (s: Shape, cursor: Pt | null): EntityRef | null => {
     if (!pendingConstraint) return null;
     const needsLineish =
-      pendingConstraint === 'horizontal' || pendingConstraint === 'vertical';
+      pendingConstraint === 'horizontal' ||
+      pendingConstraint === 'vertical' ||
+      pendingConstraint === 'distance';
     const needsPoint =
       pendingConstraint === 'fix' || pendingConstraint === 'coincident';
-    // Distance accepts whatever the user clicks: point / line / edge / circle.
-    if (pendingConstraint === 'distance') {
-      if (s.type === 'line') return { kind: 'line', shapeId: s.id };
-      if (s.type === 'circle') return { kind: 'circle', shapeId: s.id };
-      if (s.type === 'rect') return { kind: 'edge', shapeId: s.id, edge: 'top' };
-      if (s.type === 'polyline')
-        return { kind: 'point', shapeId: s.id, role: 'vertex', vertexIdx: 0 };
-      return null;
-    }
     if (needsLineish) {
       if (s.type === 'line') return { kind: 'line', shapeId: s.id };
-      if (s.type === 'rect') return { kind: 'edge', shapeId: s.id, edge: 'top' };
+      if (s.type === 'rect') {
+        // Edge nearest to the cursor in plane-local mm. Falls back to top if
+        // cursor info isn't available.
+        const edge: 'top' | 'bottom' | 'left' | 'right' = cursor
+          ? nearestRectEdge(s, cursor)
+          : 'top';
+        return { kind: 'edge', shapeId: s.id, edge };
+      }
       return null;
     }
     if (needsPoint) {
@@ -552,15 +528,6 @@ export function Sketcher({
   const offerRef = (ref: EntityRef) => {
     if (!pendingConstraint) return;
     const refs = [...pendingRefs, ref];
-    // Capture the cursor anchor when the first ref is added so we can detect
-    // mouse-motion direction by the time the user picks the second ref.
-    if (
-      pendingConstraint === 'distance' &&
-      pendingRefs.length === 0 &&
-      lastCursorMmRef.current
-    ) {
-      pendingAnchorRef.current = { ...lastCursorMmRef.current };
-    }
     if (refs.length >= arity(pendingConstraint) && canCreate(pendingConstraint, refs)) {
       finalizeConstraint(pendingConstraint, refs);
     } else {
@@ -872,30 +839,11 @@ export function Sketcher({
     const handler = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       const inField = tag === 'INPUT' || tag === 'TEXTAREA';
-      if (
-        pendingConstraint === 'distance' &&
-        (e.key === 'h' || e.key === 'H') &&
-        !inField
-      ) {
-        e.preventDefault();
-        setPendingDistanceDir((d) => (d === 'h' ? 'auto' : 'h'));
-        return;
-      }
-      if (
-        pendingConstraint === 'distance' &&
-        (e.key === 'v' || e.key === 'V') &&
-        !inField
-      ) {
-        e.preventDefault();
-        setPendingDistanceDir((d) => (d === 'v' ? 'auto' : 'v'));
-        return;
-      }
       if (e.key === 'Escape') {
         if (pendingConstraint) {
           setPendingConstraint(null);
           setPendingRefs([]);
-          setPendingDistanceDir('auto');
-          pendingAnchorRef.current = null;
+          setPendingHint(null);
         }
         else if (polyDraft) setPolyDraft(null);
         else if (draft) setDraft(null);
@@ -1020,7 +968,9 @@ export function Sketcher({
       if (pendingConstraint) {
         // Constraint pick mode — use the shape as the next ref instead of
         // entering normal selection.
-        const ref = pickRefForConstraint(s);
+        const stage = e.target.getStage();
+        const cursor = stage ? pointerToWorld(stage) : null;
+        const ref = pickRefForConstraint(s, cursor);
         if (ref) {
           e.cancelBubble = true;
           offerRef(ref);
@@ -1221,6 +1171,29 @@ export function Sketcher({
   };
 
   // Dimension callouts (drawn in unflipped layer, screen coords)
+  // While a constraint pick is in progress, highlight the entities the user
+  // has already chosen in yellow so they have visual confirmation of what
+  // counts toward the next constraint.
+  const renderPickedEntities = () => {
+    if (!pendingConstraint || pendingRefs.length === 0) return null;
+    const out: any[] = [];
+    pendingRefs.forEach((ref, i) => {
+      const ends = lineEndsOf(ref);
+      if (!ends) return;
+      out.push(
+        <KLine
+          key={`pick-${i}`}
+          points={[ends.p1.x, ends.p1.y, ends.p2.x, ends.p2.y]}
+          stroke="#fbbf24"
+          strokeWidth={3 / screenScale}
+          listening={false}
+          opacity={0.85}
+        />
+      );
+    });
+    return out;
+  };
+
   // Render dimension graphics for every distance constraint. Drawn in screen
   // px in the unflipped annotation layer so arrows / text stay sized
   // consistently regardless of zoom. Geometry is computed in plane-local mm
@@ -1252,16 +1225,16 @@ export function Sketcher({
       const aP = repOf(c.a);
       const bP = repOf(c.b);
       if (!aP || !bP) continue;
-      const dir = c.direction ?? 'auto';
-      let axis: { x: number; y: number };
-      if (dir === 'h') axis = { x: 1, y: 0 };
-      else if (dir === 'v') axis = { x: 0, y: 1 };
-      else {
+      // The dim line runs parallel to line A (and to line B since they're
+      // parallel by precondition). Falls back to a-to-b direction if A's
+      // direction can't be derived.
+      const dirVec = lineDirection(c.a) ?? lineDirection(c.b);
+      const axis = dirVec ?? (() => {
         const dx = bP.x - aP.x;
         const dy = bP.y - aP.y;
         const L = Math.hypot(dx, dy) || 1;
-        axis = { x: dx / L, y: dy / L };
-      }
+        return { x: dx / L, y: dy / L };
+      })();
       const perp = { x: -axis.y, y: axis.x };
       const offset = c.annotation?.offset ?? 5;
       const labelT = c.annotation?.labelT ?? 0.5;
@@ -1677,33 +1650,19 @@ export function Sketcher({
   );
 
   const hint = (() => {
+    if (pendingHint) return pendingHint;
     if (pendingConstraint) {
       const need = arity(pendingConstraint) - pendingRefs.length;
       const noun =
         pendingConstraint === 'horizontal' ||
         pendingConstraint === 'vertical' ||
-        pendingConstraint === 'length'
+        pendingConstraint === 'length' ||
+        pendingConstraint === 'distance'
           ? 'line or rect edge'
           : pendingConstraint === 'radius'
             ? 'circle'
-            : pendingConstraint === 'distance'
-              ? 'entity'
-              : 'point';
-      let suffix = ' Esc cancels.';
-      if (pendingConstraint === 'distance') {
-        const dir =
-          pendingDistanceDir !== 'auto'
-            ? pendingDistanceDir.toUpperCase() + ' (locked)'
-            : pendingRefs.length === 1
-              ? resolvePendingDistanceDirection() === 'h'
-                ? 'H (mouse)'
-                : resolvePendingDistanceDirection() === 'v'
-                  ? 'V (mouse)'
-                  : 'Auto'
-              : 'Auto';
-        suffix = ` · direction ${dir} · H / V to lock · Esc cancels.`;
-      }
-      return `${pendingConstraint}: pick ${need} more ${noun}${need !== 1 ? 's' : ''}.${suffix}`;
+            : 'point';
+      return `${pendingConstraint}: pick ${need} more ${noun}${need !== 1 ? 's' : ''}. Esc cancels.`;
     }
     if (tool === 'rect') return 'Drag to draw a rectangle.';
     if (tool === 'circle') return 'Drag from the center outward.';
@@ -1783,6 +1742,7 @@ export function Sketcher({
                 {renderDraft()}
                 {renderPolyDraft()}
                 {renderHandles()}
+                {renderPickedEntities()}
                 {renderSnapHint()}
               </Layer>
               <Layer listening={false}>

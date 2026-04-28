@@ -45,8 +45,6 @@ export type ConstraintType =
   | 'radius'
   | 'angle';
 
-export type DistanceDirection = 'auto' | 'h' | 'v';
-
 export interface DimensionAnnotation {
   /** Perpendicular offset from the entity-pair midline to where the dimension
    *  line is drawn, in plane-local mm. Sign determines side. */
@@ -81,11 +79,12 @@ export type Constraint =
   | {
       id: string;
       type: 'distance';
+      // Both refs must be line / edge — perpendicular distance between two
+      // parallel lines (or rect edges). Callers must add a `parallel` constraint
+      // for free lines that aren't already parallel by construction.
       a: EntityRef;
       b: EntityRef;
       value: number;
-      /** Optional. Missing means 'auto' (Euclidean / perpendicular). */
-      direction?: DistanceDirection;
       /** Optional. Missing means a sensible default is computed at render time. */
       annotation?: DimensionAnnotation;
     }
@@ -244,34 +243,6 @@ const getLineEnds = (
 // Distance helpers (cover all entity pair combos: point/line/edge/circle)
 // ────────────────────────────────────────────────────────────────────────────
 
-interface RepPoint extends Pt2 {
-  /** For a circle target, this is its radius — subtracted from the auto
-   *  (Euclidean / perpendicular) distance so the constraint operates on the
-   *  circle's circumference, not its center. Zero / undefined for non-circles. */
-  radiusOffset?: number;
-}
-
-const representativePoint = (
-  ref: EntityRef,
-  x: Float64Array,
-  layout: Layout
-): RepPoint | null => {
-  if (ref.kind === 'point') {
-    return getPoint(ref, x, layout);
-  }
-  if (ref.kind === 'line' || ref.kind === 'edge') {
-    const e = getLineEnds(ref, x, layout);
-    if (!e) return null;
-    return { x: (e.p1.x + e.p2.x) / 2, y: (e.p1.y + e.p2.y) / 2 };
-  }
-  if (ref.kind === 'circle') {
-    const b = blockOf(ref, layout);
-    if (!b || b.shape.type !== 'circle') return null;
-    return { x: x[b.offset], y: x[b.offset + 1], radiusOffset: x[b.offset + 2] };
-  }
-  return null;
-};
-
 const signedPerpDist = (
   p: Pt2,
   line: { p1: Pt2; p2: Pt2 }
@@ -310,34 +281,19 @@ const residualOf = (c: Constraint, x: Float64Array, layout: Layout): number[] =>
       return [a.x - b.x, a.y - b.y];
     }
     case 'distance': {
-      const a = representativePoint(c.a, x, layout);
-      const b = representativePoint(c.b, x, layout);
-      if (!a || !b) return [];
-      const dir = c.direction ?? 'auto';
-      // Signed h / v residuals: the user picked a first, then b, so positive
-      // value means "b is `value` mm in the +X (or +Y) direction from a".
-      if (dir === 'h') return [b.x - a.x - c.value];
-      if (dir === 'v') return [b.y - a.y - c.value];
-      // Auto (Euclidean / perpendicular). For line entities use the
-      // perpendicular distance from the other entity's representative point
-      // to the line — that's the geometrically meaningful gap. For
-      // line-to-line callers must add a `parallel` constraint themselves;
-      // when the lines are parallel the perpendicular distance from a's
-      // midpoint matches the line-to-line gap.
-      let dist: number;
-      if (c.a.kind === 'line' || c.a.kind === 'edge') {
-        const line = getLineEnds(c.a, x, layout);
-        if (!line) return [];
-        dist = Math.abs(signedPerpDist(b, line));
-      } else if (c.b.kind === 'line' || c.b.kind === 'edge') {
-        const line = getLineEnds(c.b, x, layout);
-        if (!line) return [];
-        dist = Math.abs(signedPerpDist(a, line));
-      } else {
-        dist = Math.hypot(b.x - a.x, b.y - a.y);
-      }
-      const radiusOffset = (a.radiusOffset ?? 0) + (b.radiusOffset ?? 0);
-      return [dist - radiusOffset - c.value];
+      // Perpendicular distance between two lines (or rect edges). When the
+      // pair is parallel — which the picker enforces at creation — the
+      // perpendicular distance from a's midpoint to b matches the actual
+      // line-to-line gap. abs() so the constraint stays positive regardless
+      // of which side of B point A sits on.
+      const lineA = getLineEnds(c.a, x, layout);
+      const lineB = getLineEnds(c.b, x, layout);
+      if (!lineA || !lineB) return [];
+      const midA = {
+        x: (lineA.p1.x + lineA.p2.x) / 2,
+        y: (lineA.p1.y + lineA.p2.y) / 2,
+      };
+      return [Math.abs(signedPerpDist(midA, lineB)) - c.value];
     }
     case 'length': {
       const e = getLineEnds(c.ref, x, layout);
@@ -544,9 +500,6 @@ export const arity = (type: ConstraintType): number => {
   }
 };
 
-const isMeasurable = (r: EntityRef): boolean =>
-  r.kind === 'point' || r.kind === 'line' || r.kind === 'edge' || r.kind === 'circle';
-
 export const canCreate = (type: ConstraintType, refs: EntityRef[]): boolean => {
   if (refs.length !== arity(type)) return false;
   switch (type) {
@@ -561,10 +514,11 @@ export const canCreate = (type: ConstraintType, refs: EntityRef[]): boolean => {
     case 'coincident':
       return isPoint(refs[0]) && isPoint(refs[1]);
     case 'distance':
-      // Any pair of measurable entities. For line ↔ line callers should also
-      // add a `parallel` constraint (the residual uses one line's midpoint
-      // against the other, so non-parallel pairs slide as the lines rotate).
-      return isMeasurable(refs[0]) && isMeasurable(refs[1]);
+      // Line / rect-edge pair only. The Sketcher additionally enforces
+      // parallelism (geometric or via a `parallel` constraint) before
+      // creating the constraint — the residual is perpendicular distance
+      // and only makes sense on parallel pairs.
+      return isLineish(refs[0]) && isLineish(refs[1]);
     default:
       return false;
   }
