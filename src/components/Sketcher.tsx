@@ -130,6 +130,27 @@ export function Sketcher({
   const [constraints, setConstraints] = useState<Constraint[]>(initialConstraints);
   const [pendingConstraint, setPendingConstraint] = useState<ConstraintType | null>(null);
   const [pendingRefs, setPendingRefs] = useState<EntityRef[]>([]);
+  // Direction lock for an in-progress distance constraint pick. 'auto' = follow
+  // mouse motion; 'h' / 'v' = locked via H / V key.
+  const [pendingDistanceDir, setPendingDistanceDir] = useState<'auto' | 'h' | 'v'>('auto');
+  // First-pick anchor (in mm) — used to detect provisional H / V direction
+  // from mouse motion before the user commits the second pick.
+  const pendingAnchorRef = useRef<Pt | null>(null);
+  const lastCursorMmRef = useRef<Pt | null>(null);
+  // Active drag of a dimension graphic (dim line offset or label labelT).
+  const [dimDrag, setDimDrag] = useState<
+    | {
+        constraintId: string;
+        kind: 'offset' | 'labelT';
+        baseValue: number;
+        baseScreenX: number;
+        baseScreenY: number;
+        axisMm: Pt;
+        perpMm: Pt;
+        axisLenMm: number;
+      }
+    | null
+  >(null);
   const constraintsRef = useRef(constraints);
   useEffect(() => {
     constraintsRef.current = constraints;
@@ -344,8 +365,9 @@ export function Sketcher({
     } else if (type === 'distance') {
       const a = refs[0];
       const b = refs[1];
-      const value = currentDistanceBetween(a, b);
-      next = { id, type: 'distance', a, b, value, direction: 'auto' };
+      const direction = resolvePendingDistanceDirection();
+      const value = currentSignedDistance(a, b, direction);
+      next = { id, type: 'distance', a, b, value, direction };
     }
     if (next) {
       setConstraints((prev) => [...prev, next!]);
@@ -354,6 +376,56 @@ export function Sketcher({
     }
     setPendingConstraint(null);
     setPendingRefs([]);
+    setPendingDistanceDir('auto');
+    pendingAnchorRef.current = null;
+  };
+
+  // Resolve direction for a fresh distance constraint:
+  //   - explicit lock (H / V key) wins
+  //   - otherwise compare cursor motion since the first pick: if the move is
+  //     ≥1.5× more horizontal than vertical (or vice-versa) we lock to that
+  //     axis; mostly-diagonal motion stays 'auto'
+  const resolvePendingDistanceDirection = (): 'auto' | 'h' | 'v' => {
+    if (pendingDistanceDir !== 'auto') return pendingDistanceDir;
+    const anchor = pendingAnchorRef.current;
+    const cur = lastCursorMmRef.current;
+    if (!anchor || !cur) return 'auto';
+    const dx = Math.abs(cur.x - anchor.x);
+    const dy = Math.abs(cur.y - anchor.y);
+    if (dx > dy * 1.5) return 'h';
+    if (dy > dx * 1.5) return 'v';
+    return 'auto';
+  };
+
+  // Compute the current signed component distance for h/v, or unsigned
+  // geometric distance for auto. Used as the initial value of a fresh
+  // distance constraint so the solver doesn't snap geometry to 0.
+  const currentSignedDistance = (a: EntityRef, b: EntityRef, dir: 'auto' | 'h' | 'v'): number => {
+    const repOf = (ref: EntityRef): { x: number; y: number; r?: number } | null => {
+      const s = shapes.find((sh) => sh.id === ref.shapeId);
+      if (!s) return null;
+      if (ref.kind === 'point') return pointAt(s, ref);
+      if (ref.kind === 'line' && s.type === 'line') {
+        return { x: (s.x1 + s.x2) / 2, y: (s.y1 + s.y2) / 2 };
+      }
+      if (ref.kind === 'edge' && s.type === 'rect') {
+        const w = s.width, h = s.height;
+        if (ref.edge === 'top') return { x: s.x + w / 2, y: s.y + h };
+        if (ref.edge === 'bottom') return { x: s.x + w / 2, y: s.y };
+        if (ref.edge === 'left') return { x: s.x, y: s.y + h / 2 };
+        if (ref.edge === 'right') return { x: s.x + w, y: s.y + h / 2 };
+      }
+      if (ref.kind === 'circle' && s.type === 'circle') {
+        return { x: s.cx, y: s.cy, r: s.radius };
+      }
+      return null;
+    };
+    const pa = repOf(a);
+    const pb = repOf(b);
+    if (!pa || !pb) return 0;
+    if (dir === 'h') return pb.x - pa.x;
+    if (dir === 'v') return pb.y - pa.y;
+    return currentDistanceBetween(a, b);
   };
 
   // Compute the current geometric distance between two entity refs. Mirrors
@@ -480,6 +552,15 @@ export function Sketcher({
   const offerRef = (ref: EntityRef) => {
     if (!pendingConstraint) return;
     const refs = [...pendingRefs, ref];
+    // Capture the cursor anchor when the first ref is added so we can detect
+    // mouse-motion direction by the time the user picks the second ref.
+    if (
+      pendingConstraint === 'distance' &&
+      pendingRefs.length === 0 &&
+      lastCursorMmRef.current
+    ) {
+      pendingAnchorRef.current = { ...lastCursorMmRef.current };
+    }
     if (refs.length >= arity(pendingConstraint) && canCreate(pendingConstraint, refs)) {
       finalizeConstraint(pendingConstraint, refs);
     } else {
@@ -707,9 +788,37 @@ export function Sketcher({
       }));
       return;
     }
+    // Dim graphic drag (offset or labelT). Skip the rest so we don't fall
+    // through into draft / hover handling.
+    if (dimDrag) {
+      const stage = e.target.getStage();
+      const p = stage.getPointerPosition();
+      if (!p) return;
+      const dxPx = p.x - dimDrag.baseScreenX;
+      const dyPx = p.y - dimDrag.baseScreenY;
+      // Convert screen-px delta to mm along the chosen direction. Y is flipped
+      // between screen and world (worldY = -screenY / scale), so dy is negated.
+      const along = (v: Pt) =>
+        (dxPx * v.x - dyPx * v.y) / screenScale;
+      const id = dimDrag.constraintId;
+      setConstraints((prev) =>
+        prev.map((cc) => {
+          if (cc.id !== id || cc.type !== 'distance') return cc;
+          const cur = cc.annotation ?? { offset: 5, labelT: 0.5 };
+          if (dimDrag.kind === 'offset') {
+            return { ...cc, annotation: { ...cur, offset: dimDrag.baseValue + along(dimDrag.perpMm) } };
+          }
+          // labelT: project drag along axis, normalize by dim line length.
+          const len = Math.max(1e-6, dimDrag.axisLenMm);
+          return { ...cc, annotation: { ...cur, labelT: dimDrag.baseValue + along(dimDrag.axisMm) / len } };
+        })
+      );
+      return;
+    }
     const stage = e.target.getStage();
     const pt = pointerToWorld(stage);
     if (!pt) return;
+    lastCursorMmRef.current = pt;
 
     if (draft) {
       if (draft.type === 'rect') {
@@ -729,6 +838,10 @@ export function Sketcher({
     if (isPanningRef.current) {
       isPanningRef.current = false;
       panStartRef.current = null;
+      return;
+    }
+    if (dimDrag) {
+      setDimDrag(null);
       return;
     }
     if (!draft) return;
@@ -759,10 +872,30 @@ export function Sketcher({
     const handler = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       const inField = tag === 'INPUT' || tag === 'TEXTAREA';
+      if (
+        pendingConstraint === 'distance' &&
+        (e.key === 'h' || e.key === 'H') &&
+        !inField
+      ) {
+        e.preventDefault();
+        setPendingDistanceDir((d) => (d === 'h' ? 'auto' : 'h'));
+        return;
+      }
+      if (
+        pendingConstraint === 'distance' &&
+        (e.key === 'v' || e.key === 'V') &&
+        !inField
+      ) {
+        e.preventDefault();
+        setPendingDistanceDir((d) => (d === 'v' ? 'auto' : 'v'));
+        return;
+      }
       if (e.key === 'Escape') {
         if (pendingConstraint) {
           setPendingConstraint(null);
           setPendingRefs([]);
+          setPendingDistanceDir('auto');
+          pendingAnchorRef.current = null;
         }
         else if (polyDraft) setPolyDraft(null);
         else if (draft) setDraft(null);
@@ -1187,13 +1320,30 @@ export function Sketcher({
           opacity={0.7}
           listening={false}
         />,
-        // Dim line.
+        // Dim line — draggable along the perpendicular to update offset.
         <KLine
           key={`${c.id}-dim`}
           points={[sA.sx, sA.sy, sB.sx, sB.sy]}
           stroke={stroke}
           strokeWidth={widthSel}
-          listening={false}
+          hitStrokeWidth={8}
+          onMouseDown={(e: any) => {
+            e.cancelBubble = true;
+            const stage = e.target.getStage();
+            const p = stage.getPointerPosition();
+            if (!p) return;
+            const lenMm = Math.hypot(dimB.x - dimA.x, dimB.y - dimA.y);
+            setDimDrag({
+              constraintId: c.id,
+              kind: 'offset',
+              baseValue: offset,
+              baseScreenX: p.x,
+              baseScreenY: p.y,
+              axisMm: axis,
+              perpMm: perp,
+              axisLenMm: lenMm,
+            });
+          }}
         />,
         // Arrowhead at A (pointing away from B → backward along u).
         <KLine
@@ -1225,7 +1375,7 @@ export function Sketcher({
           strokeWidth={widthSel}
           listening={false}
         />,
-        // Value label — clickable / dbl-clickable.
+        // Value label — clickable, dbl-click to edit, drag to move along axis.
         <Text
           key={`${c.id}-label`}
           x={sLabel.sx + 4}
@@ -1234,6 +1384,23 @@ export function Sketcher({
           fontSize={11}
           fontFamily="ui-monospace, monospace"
           fill={stroke}
+          onMouseDown={(e: any) => {
+            e.cancelBubble = true;
+            const stage = e.target.getStage();
+            const p = stage.getPointerPosition();
+            if (!p) return;
+            const lenMm = Math.hypot(dimB.x - dimA.x, dimB.y - dimA.y);
+            setDimDrag({
+              constraintId: c.id,
+              kind: 'labelT',
+              baseValue: labelT,
+              baseScreenX: p.x,
+              baseScreenY: p.y,
+              axisMm: axis,
+              perpMm: perp,
+              axisLenMm: lenMm,
+            });
+          }}
           onDblClick={(e: any) => {
             e.cancelBubble = true;
             setInlineEditor({
@@ -1519,8 +1686,24 @@ export function Sketcher({
           ? 'line or rect edge'
           : pendingConstraint === 'radius'
             ? 'circle'
-            : 'point';
-      return `${pendingConstraint}: pick ${need} more ${noun}${need !== 1 ? 's' : ''}. Esc cancels.`;
+            : pendingConstraint === 'distance'
+              ? 'entity'
+              : 'point';
+      let suffix = ' Esc cancels.';
+      if (pendingConstraint === 'distance') {
+        const dir =
+          pendingDistanceDir !== 'auto'
+            ? pendingDistanceDir.toUpperCase() + ' (locked)'
+            : pendingRefs.length === 1
+              ? resolvePendingDistanceDirection() === 'h'
+                ? 'H (mouse)'
+                : resolvePendingDistanceDirection() === 'v'
+                  ? 'V (mouse)'
+                  : 'Auto'
+              : 'Auto';
+        suffix = ` · direction ${dir} · H / V to lock · Esc cancels.`;
+      }
+      return `${pendingConstraint}: pick ${need} more ${noun}${need !== 1 ? 's' : ''}.${suffix}`;
     }
     if (tool === 'rect') return 'Drag to draw a rectangle.';
     if (tool === 'circle') return 'Drag from the center outward.';
