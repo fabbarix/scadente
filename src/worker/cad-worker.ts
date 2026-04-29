@@ -1,4 +1,11 @@
-import { setOC, drawCircle, drawRoundedRectangle, draw, Plane } from "replicad";
+import {
+  setOC,
+  drawCircle,
+  drawRoundedRectangle,
+  draw,
+  Plane,
+  measureShapeVolumeProperties,
+} from "replicad";
 import initOpenCascade from "replicad-opencascadejs/src/replicad_single.js";
 import opencascadeWasm from "replicad-opencascadejs/src/replicad_single.wasm?url";
 import { zipSync, strToU8 } from "fflate";
@@ -22,7 +29,14 @@ const PLANARITY_DOT = 0.999; // ~2.5° tolerance
 interface FaceMetaPayload {
   faceId: number;
   origin: [number, number, number];
+  /** Plane normal sent to OpenCascade. May be flipped from the face's outward
+   *  normal when needed to keep `xDir` along a positive world axis (so the
+   *  sketcher feels natural to read). Use `outwardNormal` for the original
+   *  outward direction. */
   normal: [number, number, number];
+  /** The face's true outward normal (always points away from the solid).
+   *  Equal to `normal` when no flip was applied. */
+  outwardNormal: [number, number, number];
   xDir: [number, number, number];
   isPlanar: boolean;
   triangleStart: number;
@@ -60,9 +74,23 @@ const computeFaceMeta = (faces: any): Record<number, FaceMetaPayload> => {
     }
     if (!count) continue;
 
-    const origin: [number, number, number] = [cx / count, cy / count, cz / count];
+    const centroid: [number, number, number] = [cx / count, cy / count, cz / count];
     let nLen = Math.hypot(nxSum, nySum, nzSum) || 1;
     const normal: [number, number, number] = [nxSum / nLen, nySum / nLen, nzSum / nLen];
+
+    // Sketch origin: world origin projected onto the face's plane. For a
+    // face whose plane contains (0,0,0) — e.g. a side face whose bottom
+    // edge sits on the floor — the origin is exactly (0,0,0), so the
+    // sketcher's X axis lines up with the world ground line and the
+    // face's bottom edge appears at sketch y=0. For offset faces the
+    // origin is the closest point on the plane to the world origin
+    // (still on the plane, just shifted).
+    const dotCN = normal[0] * centroid[0] + normal[1] * centroid[1] + normal[2] * centroid[2];
+    const origin: [number, number, number] = [
+      normal[0] * dotCN,
+      normal[1] * dotCN,
+      normal[2] * dotCN,
+    ];
 
     // Planarity check: every sampled vertex normal must be within tolerance of the average.
     let isPlanar = true;
@@ -72,25 +100,47 @@ const computeFaceMeta = (faces: any): Record<number, FaceMetaPayload> => {
       if (dot < PLANARITY_DOT) { isPlanar = false; break; }
     }
 
-    // xDir: project world X onto plane (or world Y if X is too parallel to normal).
-    let ref: [number, number, number] = [1, 0, 0];
-    if (Math.abs(normal[0]) > 0.95) ref = [0, 1, 0];
-    const d = ref[0] * normal[0] + ref[1] * normal[1] + ref[2] * normal[2];
-    const xRaw: [number, number, number] = [
-      ref[0] - d * normal[0],
-      ref[1] - d * normal[1],
-      ref[2] - d * normal[2],
+    // Sketch "up" should match the world's up direction (Z-up CAD
+    // convention used everywhere else: box op extrudes in +Z, the floor
+    // grid sits on the XY plane, the camera's up vector is +Z). Prefer
+    // world +Z as the projection reference. For ±Z faces (top/bottom,
+    // where +Z is parallel to the normal) +Z collapses to zero, so fall
+    // back to world +Y.
+    let upRef: [number, number, number] = [0, 0, 1];
+    if (Math.abs(normal[2]) > 0.95) upRef = [0, 1, 0];
+    const dUp =
+      upRef[0] * normal[0] + upRef[1] * normal[1] + upRef[2] * normal[2];
+    const yRaw: [number, number, number] = [
+      upRef[0] - dUp * normal[0],
+      upRef[1] - dUp * normal[1],
+      upRef[2] - dUp * normal[2],
     ];
-    const xLen = Math.hypot(xRaw[0], xRaw[1], xRaw[2]) || 1;
-    const xDir: [number, number, number] = [xRaw[0] / xLen, xRaw[1] / xLen, xRaw[2] / xLen];
+    const yLen = Math.hypot(yRaw[0], yRaw[1], yRaw[2]) || 1;
+    const yDirWorld: [number, number, number] = [
+      yRaw[0] / yLen,
+      yRaw[1] / yLen,
+      yRaw[2] / yLen,
+    ];
+    // xDir = yDir × normal so (xDir, yDir, normal) is right-handed with the
+    // face's outward normal. This is the "viewer's perspective" convention:
+    // looking AT the face from outside (from +normal), sketch +x points to
+    // the user's right. World axis indicators in the sketcher tell the user
+    // exactly which world axis each direction corresponds to.
+    const outwardNormal: [number, number, number] = [...normal];
+    const xDir: [number, number, number] = [
+      yDirWorld[1] * normal[2] - yDirWorld[2] * normal[1],
+      yDirWorld[2] * normal[0] - yDirWorld[0] * normal[2],
+      yDirWorld[0] * normal[1] - yDirWorld[1] * normal[0],
+    ];
+    const planeNormal: [number, number, number] = [...normal];
 
     let boundary: number[] | undefined;
     if (isPlanar) {
-      // y-axis in the plane = normal × xDir
+      // y-axis in the plane = planeNormal × xDir (== yDirWorld by construction).
       const yDir: [number, number, number] = [
-        normal[1] * xDir[2] - normal[2] * xDir[1],
-        normal[2] * xDir[0] - normal[0] * xDir[2],
-        normal[0] * xDir[1] - normal[1] * xDir[0],
+        planeNormal[1] * xDir[2] - planeNormal[2] * xDir[1],
+        planeNormal[2] * xDir[0] - planeNormal[0] * xDir[2],
+        planeNormal[0] * xDir[1] - planeNormal[1] * xDir[0],
       ];
       const project = (vi: number): [number, number] => {
         const dx = vertices[vi * 3] - origin[0];
@@ -134,7 +184,8 @@ const computeFaceMeta = (faces: any): Record<number, FaceMetaPayload> => {
     meta[g.faceId] = {
       faceId: g.faceId,
       origin,
-      normal,
+      normal: planeNormal,
+      outwardNormal,
       xDir,
       isPlanar,
       triangleStart: g.start,
@@ -143,6 +194,49 @@ const computeFaceMeta = (faces: any): Record<number, FaceMetaPayload> => {
     };
   }
   return meta;
+};
+
+/**
+ * Locate the face on the current model that matches a stored anchor
+ * (origin + outward normal). Used so face-anchored sketch_extrude ops can
+ * pick up live geometry when an upstream op (e.g. the box dims) changes.
+ *
+ * Match criteria, in order of strictness:
+ *   1. Outward normal aligns within ~8° (dot ≥ 0.99).
+ *   2. Anchor origin lies within `planeTolMm` of the candidate's plane.
+ *   3. Tie-breaker: smallest 3D distance from anchor origin to face centroid.
+ */
+const resolveFaceAnchor = (
+  meta: Record<number, FaceMetaPayload>,
+  anchor: {
+    origin: [number, number, number];
+    outwardNormal: [number, number, number];
+  },
+  planeTolMm = 5
+): FaceMetaPayload | null => {
+  let best: FaceMetaPayload | null = null;
+  let bestCentroidDist = Infinity;
+  for (const f of Object.values(meta)) {
+    if (!f.isPlanar) continue;
+    const dotN =
+      f.outwardNormal[0] * anchor.outwardNormal[0] +
+      f.outwardNormal[1] * anchor.outwardNormal[1] +
+      f.outwardNormal[2] * anchor.outwardNormal[2];
+    if (dotN < 0.99) continue;
+    const dx = anchor.origin[0] - f.origin[0];
+    const dy = anchor.origin[1] - f.origin[1];
+    const dz = anchor.origin[2] - f.origin[2];
+    const planeDist = Math.abs(
+      dx * f.outwardNormal[0] + dy * f.outwardNormal[1] + dz * f.outwardNormal[2]
+    );
+    if (planeDist > planeTolMm) continue;
+    const centroidDist = Math.hypot(dx, dy, dz);
+    if (centroidDist < bestCentroidDist) {
+      bestCentroidDist = centroidDist;
+      best = f;
+    }
+  }
+  return best;
 };
 
 // ---- 3MF export helpers ----
@@ -221,17 +315,21 @@ const computeEdgeMeta = (edges: any): Record<number, EdgeMetaPayload> => {
   const lines: number[] = edges.lines ?? [];
   if (!groups.length || !lines.length) return meta;
   for (const g of groups) {
-    let cx = 0, cy = 0, cz = 0, count = 0;
-    for (let i = g.start; i < g.start + g.count; i++) {
-      cx += lines[i * 3];
-      cy += lines[i * 3 + 1];
-      cz += lines[i * 3 + 2];
-      count++;
-    }
-    if (!count) continue;
+    if (!g.count) continue;
+    // Pick a sampled vertex that's actually ON the edge. The previous
+    // implementation averaged all sampled points — fine for straight edges
+    // (the average IS on the segment) but wrong for curves: the centroid
+    // of a full circle's samples is the circle's CENTER, which is off the
+    // edge, so `edge.containsPoint(midpoint)` later misses for fillet /
+    // chamfer. The middle vertex of the polyline is always on the edge.
+    const midIdx = g.start + Math.floor(g.count / 2);
     meta[g.edgeId] = {
       edgeId: g.edgeId,
-      midpoint: [cx / count, cy / count, cz / count],
+      midpoint: [
+        lines[midIdx * 3],
+        lines[midIdx * 3 + 1],
+        lines[midIdx * 3 + 2],
+      ],
       vertexStart: g.start,
       vertexCount: g.count,
     };
@@ -243,20 +341,107 @@ interface SketchGhostPayload {
   id: string;
   planeOrigin: [number, number, number];
   planeNormal: [number, number, number];
+  planeOutwardNormal: [number, number, number];
   planeXDir: [number, number, number];
+  /** Plane preset hint used by the App when re-opening the sketch for
+   *  editing — `'FACE'` means the plane was anchored to a face and the
+   *  worker resolved the live geometry. */
+  planePreset?: 'XY' | 'XZ' | 'YZ' | 'FACE';
+  /** Live face boundary (plane-local 2D segments) when the sketch is
+   *  anchored to a face. Empty / omitted otherwise. */
+  referenceOutline?: number[];
   depth: number;
   faces: any;
   edges: any;
 }
 
+/**
+ * Per-op outcome shipped back to the App. The sidebar uses this to badge
+ * ops that the user may want to clean up after removing an upstream op:
+ *   `'ok'`             — the op produced its expected effect.
+ *   `'no-effect'`      — fillet/chamfer matched zero edges, or a positive-
+ *                         depth sketch_extrude couldn't fuse / cut anything.
+ *   `'face-missing'`   — a face-anchored sketch_extrude lost its face when
+ *                         the upstream op that owned it was removed.
+ *   `'invalid'`        — fillet/chamfer produced a corrupted solid (radius
+ *                         too large for the geometry, self-intersecting
+ *                         faces). The bad operation was reverted; the user
+ *                         should reduce the radius.
+ */
+type OpStatus = 'ok' | 'no-effect' | 'face-missing' | 'invalid';
+
+/**
+ * Sanity check on a Solid produced by fillet/chamfer. OpenCASCADE doesn't
+ * always throw on a too-large radius — it can return a body whose faces
+ * self-intersect.
+ *
+ * The two checks we actually need:
+ *
+ *   1. The result has a finite, positive volume — catches NaN / zero
+ *      volume from catastrophic failures.
+ *   2. The result's axis-aligned bounding box doesn't grow past the
+ *      input's bbox (within a small eps). A fillet only ever removes
+ *      corner material, so the new envelope must fit inside the old one.
+ *      A self-extending "skirt" surface caused by an over-sized radius
+ *      pushes the bbox outward and gets caught here.
+ *
+ * Volume ratios were tried earlier and false-positived on legitimate
+ * large fillets — a single fillet can remove a substantial fraction of
+ * a small solid without anything being wrong.
+ */
+const BBOX_EPS_MM = 0.1;
+
+const validateFilletResult = (before: any, after: any): boolean => {
+  if (!after || !before) return false;
+  // Volume sanity. We only require that the result has a positive finite
+  // volume; we don't compare to `before` because the change is
+  // geometry-dependent and any threshold has false positives.
+  try {
+    const vAfter = measureShapeVolumeProperties(after).volume;
+    if (!Number.isFinite(vAfter) || vAfter <= 0) return false;
+  } catch {
+    return false;
+  }
+  // Bounding-box containment. After's bbox must be ≤ before's bbox in
+  // every axis, with `BBOX_EPS_MM` slack for OpenCASCADE numerical noise.
+  try {
+    const [minB, maxB] = before.boundingBox.bounds as [
+      [number, number, number],
+      [number, number, number]
+    ];
+    const [minA, maxA] = after.boundingBox.bounds as [
+      [number, number, number],
+      [number, number, number]
+    ];
+    for (let i = 0; i < 3; i++) {
+      if (minA[i] < minB[i] - BBOX_EPS_MM) return false;
+      if (maxA[i] > maxB[i] + BBOX_EPS_MM) return false;
+    }
+  } catch {
+    return false;
+  }
+  return true;
+};
+
 interface BuildResult {
   model: any;
   sketches: SketchGhostPayload[];
+  diagnostics: Record<string, OpStatus>;
 }
 
 const drawingFromShape = (shape: any): any => {
   if (shape.type === "rect") {
     return drawRoundedRectangle(shape.width, shape.height).translate(shape.x, shape.y);
+  }
+  if (shape.type === "rounded-rect") {
+    const r = Math.max(
+      0,
+      Math.min(shape.cornerRadius ?? 0, Math.min(shape.width, shape.height) / 2)
+    );
+    return drawRoundedRectangle(shape.width, shape.height, r).translate(
+      shape.x,
+      shape.y
+    );
   }
   if (shape.type === "circle") {
     return drawCircle(shape.radius).translate(shape.x, shape.y);
@@ -271,24 +456,47 @@ const drawingFromShape = (shape: any): any => {
     for (const p of rest) pen = pen.lineTo([p.x, p.y]);
     return pen.close();
   }
+  if (
+    shape.type === "compound" &&
+    Array.isArray(shape.segments) &&
+    shape.segments.length >= 2
+  ) {
+    // A compound is a closed loop of `line` / `arc` segments produced by
+    // the sketcher's chain-detector. Each segment carries its endpoints
+    // (and a midpoint for arcs) in walk order, so we can replay them on
+    // replicad's pen API.
+    const first = shape.segments[0];
+    let pen: any = draw([first.p1.x, first.p1.y]);
+    for (const seg of shape.segments) {
+      if (seg.type === "line") {
+        pen = pen.lineTo([seg.p2.x, seg.p2.y]);
+      } else if (seg.type === "arc") {
+        // replicad expects [endX, endY], [midX, midY] in absolute coords.
+        pen = pen.threePointsArcTo(
+          [seg.p2.x, seg.p2.y],
+          [seg.pMid.x, seg.pMid.y]
+        );
+      }
+    }
+    return pen.close();
+  }
   return null;
 };
 
 /**
- * Build the extruded shape with 3D boolean operations on individual solids.
- * Each additive shape is extruded and fused into a running additive solid;
- * each subtractive shape is extruded then cut from the result. This is the
- * pattern replicad's docs recommend (e.g. `house.cut(window).fuse(door)`),
- * and unlike 2D-compound booleans it handles multiple disjoint regions
- * correctly — e.g. two pairs of concentric circles produce two tubes.
+ * Build the extruded shape with 3D boolean operations on individual solids,
+ * applied in **declaration order**. The first additive shape seeds the
+ * solid; each subsequent shape fuses or cuts depending on its operation.
+ * Order matters — e.g. `rect (add) → big circle (subtract) → small circle
+ * (add)` leaves an island in the middle of the hole, exactly as the user
+ * arranged the layers.
  */
 const buildShapes = (
   shapes: any[],
   sketchPlane: any,
   depth: number
 ): any => {
-  let added: any = null;
-  const subtractiveSolids: any[] = [];
+  let result: any = null;
   for (const shape of shapes) {
     const d = drawingFromShape(shape);
     if (!d) continue;
@@ -299,53 +507,109 @@ const buildShapes = (
       console.error("Sketch extrude error:", e);
       continue;
     }
-    if (shape.operation === "subtract") {
-      subtractiveSolids.push(solid);
-    } else if (!added) {
-      added = solid;
-    } else {
-      try {
-        added = added.fuse(solid);
-      } catch (e) {
-        console.error("Additive 3D fuse error:", e);
-      }
+    const isSubtract = shape.operation === "subtract";
+    if (!result) {
+      // The first shape seeds the solid. A leading subtract has nothing to
+      // cut into so it's silently dropped — the user must have at least one
+      // additive shape before the subtract takes effect.
+      if (isSubtract) continue;
+      result = solid;
+      continue;
     }
-  }
-  if (!added) return null;
-  let result = added;
-  for (const sub of subtractiveSolids) {
     try {
-      result = result.cut(sub);
+      result = isSubtract ? result.cut(solid) : result.fuse(solid);
     } catch (e) {
-      console.error("Subtractive 3D cut error:", e);
+      console.error(`Sketch ${isSubtract ? "cut" : "fuse"} error:`, e);
     }
   }
   return result;
 };
 
-const buildModel = (history: any[]): BuildResult => {
+// Per-op cache entry: the running model AFTER processing this op, plus the
+// ghost payload it produced (for sketch_extrude ops). Lets a depth-only edit
+// reuse all earlier ops' models without re-running their booleans / meshing.
+interface CachedOp {
+  model: any;
+  sketch: SketchGhostPayload | null;
+  status: OpStatus;
+}
+
+// Prefix-stable cache. On each BUILD we walk `history` and reuse cached
+// entries up to the first op whose JSON differs from the previous build —
+// in the common case (depth-drag on the last op) every prior op hits.
+// Cleared by HMR / worker reload.
+let prefixCache: { history: any[]; entries: CachedOp[] } | null = null;
+
+const buildModel = (
+  history: any[],
+  _opts: { preview?: boolean } = {}
+): BuildResult => {
   let model: any = null;
   const sketches: SketchGhostPayload[] = [];
+  let startIdx = 0;
 
-  for (const op of history) {
+  // Find longest matching prefix from the previous build. Reuse the cached
+  // running `model` reference (replicad solids are immutable from our side
+  // once handed to fuse/cut, so the reference is safe to forward).
+  if (prefixCache) {
+    const cap = Math.min(prefixCache.history.length, history.length);
+    for (let i = 0; i < cap; i++) {
+      if (
+        JSON.stringify(prefixCache.history[i]) !==
+        JSON.stringify(history[i])
+      ) {
+        break;
+      }
+      model = prefixCache.entries[i].model;
+      const cachedSketch = prefixCache.entries[i].sketch;
+      if (cachedSketch) sketches.push(cachedSketch);
+      startIdx = i + 1;
+    }
+  }
+
+  const entries: CachedOp[] = prefixCache
+    ? prefixCache.entries.slice(0, startIdx)
+    : [];
+
+  for (let i = startIdx; i < history.length; i++) {
+    const op = history[i];
+    let opSketch: SketchGhostPayload | null = null;
+    let opStatus: OpStatus = 'ok';
     if (op.type === "fillet" || op.type === "chamfer") {
+      // Track whether ANY edge actually changed. If none did (no model yet,
+      // or every edge predicate matched zero edges), the op is a no-op.
+      // If an edge produced an invalid solid (radius too large), revert
+      // that edge and flag the op so the sidebar can warn the user.
+      const before = model;
+      let anyInvalid = false;
       if (model && Array.isArray(op.params.edgePoints)) {
         const value =
           op.type === "fillet" ? op.params.radius : op.params.distance;
         if (typeof value === "number" && value > 0) {
           for (const pt of op.params.edgePoints) {
+            const previous = model;
             try {
-              if (op.type === "fillet") {
-                model = model.fillet(value, (e: any) => e.containsPoint(pt));
+              const next =
+                op.type === "fillet"
+                  ? model.fillet(value, (e: any) => e.containsPoint(pt))
+                  : model.chamfer(value, (e: any) => e.containsPoint(pt));
+              if (validateFilletResult(previous, next)) {
+                model = next;
               } else {
-                model = model.chamfer(value, (e: any) => e.containsPoint(pt));
+                // Bad result — keep the prior model. The radius is too
+                // large for the local geometry at this edge.
+                anyInvalid = true;
               }
             } catch (e) {
               console.error(`${op.type} error:`, e);
+              anyInvalid = true;
             }
           }
         }
       }
+      if (anyInvalid) opStatus = 'invalid';
+      else if (model === before) opStatus = 'no-effect';
+      entries.push({ model, sketch: null, status: opStatus });
       continue;
     }
 
@@ -356,28 +620,88 @@ const buildModel = (history: any[]): BuildResult => {
         .sketchOnPlane()
         .extrude(op.params.depth);
     } else if (op.type === "sketch_extrude") {
-      const planeSpec = op.params.plane;
+      let planeSpec = op.params.plane;
+      let referenceOutline: number[] | undefined = op.params.referenceOutline;
+
+      // Face-anchored sketches: re-resolve the plane against the current
+      // model's faces so changes upstream (e.g. resizing the parent box)
+      // propagate to the sketch's plane and reference outline. The stored
+      // origin + outwardNormal serve as the anchor — the worker finds the
+      // face whose plane still contains that anchor and uses its live
+      // geometry.
+      if (planeSpec?.preset === "FACE" && planeSpec.outwardNormal) {
+        let matched: FaceMetaPayload | null = null;
+        if (model) {
+          try {
+            const facesData = model.mesh({ tolerance: 0.1, angularTolerance: 30 });
+            const liveMeta = computeFaceMeta(facesData);
+            matched = resolveFaceAnchor(liveMeta, {
+              origin: planeSpec.origin,
+              outwardNormal: planeSpec.outwardNormal,
+            });
+          } catch (e) {
+            console.error("Face anchor resolve error:", e);
+          }
+        }
+        if (matched) {
+          planeSpec = {
+            ...planeSpec,
+            origin: matched.origin,
+            xDir: matched.xDir,
+            normal: matched.normal,
+            outwardNormal: matched.outwardNormal,
+          };
+          referenceOutline = matched.boundary ?? referenceOutline;
+        } else {
+          // The face the sketch was anchored to no longer exists (upstream
+          // op gone or geometry changed). The stored plane is used as a
+          // fallback but the user almost certainly wants to remove or
+          // re-target this op.
+          opStatus = 'face-missing';
+        }
+      }
+
       const sketchPlane = planeSpec
         ? new Plane(planeSpec.origin, planeSpec.xDir, planeSpec.normal)
         : undefined;
       const depth: number = op.params.depth ?? 0;
 
+      // The plane normal sent to OpenCascade may be inverted from the face's
+      // true outward direction (so xDir lands on a positive world axis). The
+      // user's depth>0 should still grow the solid outward — so when the two
+      // disagree, extrude in the opposite direction along the plane normal.
+      const outwardN: [number, number, number] | undefined = planeSpec?.outwardNormal;
+      const outwardSign =
+        outwardN && planeSpec
+          ? Math.sign(
+              outwardN[0] * planeSpec.normal[0] +
+                outwardN[1] * planeSpec.normal[1] +
+                outwardN[2] * planeSpec.normal[2]
+            ) || 1
+          : 1;
+      const extrudeDepth = depth * outwardSign;
+
       // Always produce a ghost mesh so the user can see where the sketch is.
       const ghost = buildShapes(op.params.shapes, sketchPlane, GHOST_THICKNESS);
       if (ghost) {
-        sketches.push({
+        const payload: SketchGhostPayload = {
           id: op.id,
           planeOrigin: planeSpec?.origin ?? [0, 0, 0],
           planeNormal: planeSpec?.normal ?? [0, 0, 1],
           planeXDir: planeSpec?.xDir ?? [1, 0, 0],
+          planeOutwardNormal: outwardN ?? planeSpec?.normal ?? [0, 0, 1],
+          planePreset: planeSpec?.preset,
+          referenceOutline,
           depth,
           faces: ghost.mesh({ tolerance: 0.1, angularTolerance: 30 }),
           edges: ghost.meshEdges(),
-        });
+        };
+        sketches.push(payload);
+        opSketch = payload;
       }
 
       if (Math.abs(depth) > 1e-6) {
-        currentShape = buildShapes(op.params.shapes, sketchPlane, depth);
+        currentShape = buildShapes(op.params.shapes, sketchPlane, extrudeDepth);
       }
     }
 
@@ -385,27 +709,56 @@ const buildModel = (history: any[]): BuildResult => {
       const isPocket =
         op.type === "sketch_extrude" && op.params.mode === "pocket";
       if (isPocket) {
-        // Pockets cut from the running model. With no model yet they're a no-op.
+        // Pockets cut from the running model. With no model yet they're a
+        // no-op — the cut shape was built but had nothing to cut into.
         if (model) {
+          const before = model;
           try {
             model = model.cut(currentShape);
           } catch (e) {
             console.error("Pocket cut error:", e);
           }
+          if (model === before) opStatus = 'no-effect';
+        } else {
+          opStatus = 'no-effect';
         }
       } else if (!model) {
         model = currentShape;
       } else {
+        const before = model;
         try {
           model = model.fuse(currentShape);
         } catch (e) {
           console.error("Model fuse error:", e);
         }
+        if (model === before) opStatus = 'no-effect';
       }
+    } else if (
+      op.type === "sketch_extrude" &&
+      Math.abs(op.params.depth ?? 0) > 1e-6
+    ) {
+      // Non-zero depth requested but `buildShapes` produced nothing —
+      // probably no closed shapes in the sketch. Worth flagging.
+      opStatus = 'no-effect';
     }
+    entries.push({ model, sketch: opSketch, status: opStatus });
   }
 
-  return { model, sketches };
+  // Refresh the cache. Snapshot history (deep-clone via JSON round-trip so
+  // future param mutations on the App side don't poison cached comparisons).
+  prefixCache = {
+    history: history.map((op) => JSON.parse(JSON.stringify(op))),
+    entries,
+  };
+
+  // Build the diagnostics map (op id → status) from the entries — order
+  // matches `history`, so we can pair them up.
+  const diagnostics: Record<string, OpStatus> = {};
+  for (let i = 0; i < history.length; i++) {
+    diagnostics[history[i].id] = entries[i]?.status ?? 'ok';
+  }
+
+  return { model, sketches, diagnostics };
 };
 
 self.onmessage = async (e) => {
@@ -424,18 +777,33 @@ self.onmessage = async (e) => {
   if (type === "BUILD") {
     try {
       await init();
-      const { model, sketches } = buildModel(payload.history);
+      const preview = !!payload.preview;
+      const { model, sketches, diagnostics } = buildModel(payload.history, {
+        preview,
+      });
 
+      // Preview builds: coarser tessellation + skip face/edge meta. The
+      // App keeps the previous meta in state so picking still works after
+      // the drag ends, and the next non-preview build refreshes them.
+      const meshTol = preview ? 0.5 : 0.1;
       const faces = model
-        ? model.mesh({ tolerance: 0.1, angularTolerance: 30 })
+        ? model.mesh({ tolerance: meshTol, angularTolerance: 30 })
         : null;
       const edges = model ? model.meshEdges() : null;
-      const faceMeta = faces ? computeFaceMeta(faces) : {};
-      const edgeMeta = edges ? computeEdgeMeta(edges) : {};
+      const faceMeta = preview || !faces ? {} : computeFaceMeta(faces);
+      const edgeMeta = preview || !edges ? {} : computeEdgeMeta(edges);
 
       self.postMessage({
         type: "BUILD_SUCCESS",
-        payload: { faces, edges, sketches, faceMeta, edgeMeta },
+        payload: {
+          faces,
+          edges,
+          sketches,
+          faceMeta,
+          edgeMeta,
+          preview,
+          diagnostics,
+        },
       });
     } catch (error: any) {
       console.error("Worker Build Error:", error);

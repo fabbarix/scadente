@@ -43,7 +43,11 @@ export type ConstraintType =
   | 'distance'
   | 'length'
   | 'radius'
-  | 'angle';
+  | 'angle'
+  // Pin a single coordinate of a point. Used by the property-panel
+  // auto-locking flow so the user can lock just X or just Y.
+  | 'coord-x'
+  | 'coord-y';
 
 export interface DimensionAnnotation {
   /** Perpendicular offset from the entity-pair midline to where the dimension
@@ -53,14 +57,27 @@ export interface DimensionAnnotation {
    *  (0 = near a-end, 0.5 = middle, 1 = near b-end). May exceed [0,1]
    *  to push the label outside the extension lines. */
   labelT: number;
+  /** Perpendicular offset of the label from the dimension line, in mm.
+   *  Lets the user nudge the value text off the line so it doesn't overlap. */
+  labelP?: number;
+}
+
+interface ConstraintBase {
+  /** Optional user-provided label, shown in the constraints panel. */
+  name?: string;
+  /** When set, identifies the property-panel field this constraint locks
+   *  (e.g. `r1.width`, `c1.cx`). The field-locking UI uses it to detect
+   *  whether a NumField is locked and to update / remove the right
+   *  constraint when the user types a new value or unlocks. */
+  field?: string;
 }
 
 export type Constraint =
   // Geometric (single-entity)
-  | { id: string; type: 'horizontal' | 'vertical'; ref: EntityRef }
-  | { id: string; type: 'fix'; ref: EntityRef; value: { x: number; y: number } }
+  | (ConstraintBase & { id: string; type: 'horizontal' | 'vertical'; ref: EntityRef })
+  | (ConstraintBase & { id: string; type: 'fix'; ref: EntityRef; value: { x: number; y: number } })
   // Geometric (pair)
-  | {
+  | (ConstraintBase & {
       id: string;
       type:
         | 'coincident'
@@ -72,24 +89,31 @@ export type Constraint =
         | 'tangent';
       a: EntityRef;
       b: EntityRef;
-    }
-  | { id: string; type: 'midpoint'; point: EntityRef; line: EntityRef }
-  | { id: string; type: 'symmetry'; a: EntityRef; b: EntityRef; axis: EntityRef }
+    })
+  | (ConstraintBase & { id: string; type: 'midpoint'; point: EntityRef; line: EntityRef })
+  | (ConstraintBase & { id: string; type: 'symmetry'; a: EntityRef; b: EntityRef; axis: EntityRef })
   // Dimensional
-  | {
+  | (ConstraintBase & {
       id: string;
       type: 'distance';
-      // Both refs must be line / edge — perpendicular distance between two
-      // parallel lines (or rect edges). Callers must add a `parallel` constraint
-      // for free lines that aren't already parallel by construction.
+      // Supported pairings:
+      //   line/edge + line/edge (must be parallel — perpendicular distance)
+      //   point + line/edge (any direction — perpendicular distance from
+      //   point to the line carrying the segment)
       a: EntityRef;
       b: EntityRef;
       value: number;
       /** Optional. Missing means a sensible default is computed at render time. */
       annotation?: DimensionAnnotation;
-    }
-  | { id: string; type: 'length' | 'radius'; ref: EntityRef; value: number }
-  | { id: string; type: 'angle'; a: EntityRef; b: EntityRef; value: number };
+    })
+  | (ConstraintBase & { id: string; type: 'length' | 'radius'; ref: EntityRef; value: number })
+  | (ConstraintBase & { id: string; type: 'angle'; a: EntityRef; b: EntityRef; value: number })
+  | (ConstraintBase & {
+      id: string;
+      type: 'coord-x' | 'coord-y';
+      ref: EntityRef;
+      value: number;
+    });
 
 // ────────────────────────────────────────────────────────────────────────────
 // Parameter layout
@@ -108,7 +132,9 @@ export interface Layout {
 
 const blockSize = (s: SketcherShape): number => {
   if (s.type === 'rect') return 4;
+  if (s.type === 'rounded-rect') return 5; // x, y, w, h, cornerRadius
   if (s.type === 'circle') return 3;
+  if (s.type === 'arc') return 5; // cx, cy, radius, startAngle, endAngle
   if (s.type === 'line') return 4;
   return s.points.length * 2;
 };
@@ -134,10 +160,22 @@ export const packShapes = (shapes: SketcherShape[], layout: Layout): Float64Arra
       x[o + 1] = s.y;
       x[o + 2] = s.width;
       x[o + 3] = s.height;
+    } else if (s.type === 'rounded-rect') {
+      x[o] = s.x;
+      x[o + 1] = s.y;
+      x[o + 2] = s.width;
+      x[o + 3] = s.height;
+      x[o + 4] = s.cornerRadius;
     } else if (s.type === 'circle') {
       x[o] = s.cx;
       x[o + 1] = s.cy;
       x[o + 2] = s.radius;
+    } else if (s.type === 'arc') {
+      x[o] = s.cx;
+      x[o + 1] = s.cy;
+      x[o + 2] = s.radius;
+      x[o + 3] = s.startAngle;
+      x[o + 4] = s.endAngle;
     } else if (s.type === 'line') {
       x[o] = s.x1;
       x[o + 1] = s.y1;
@@ -160,8 +198,26 @@ export const unpackShapes = (x: Float64Array, layout: Layout): SketcherShape[] =
     const s = b.shape;
     if (s.type === 'rect') {
       out.push({ ...s, x: x[o], y: x[o + 1], width: x[o + 2], height: x[o + 3] });
+    } else if (s.type === 'rounded-rect') {
+      out.push({
+        ...s,
+        x: x[o],
+        y: x[o + 1],
+        width: x[o + 2],
+        height: x[o + 3],
+        cornerRadius: x[o + 4],
+      });
     } else if (s.type === 'circle') {
       out.push({ ...s, cx: x[o], cy: x[o + 1], radius: x[o + 2] });
+    } else if (s.type === 'arc') {
+      out.push({
+        ...s,
+        cx: x[o],
+        cy: x[o + 1],
+        radius: x[o + 2],
+        startAngle: x[o + 3],
+        endAngle: x[o + 4],
+      });
     } else if (s.type === 'line') {
       out.push({ ...s, x1: x[o], y1: x[o + 1], x2: x[o + 2], y2: x[o + 3] });
     } else {
@@ -195,7 +251,16 @@ const getPoint = (ref: EntityRef, x: Float64Array, layout: Layout): Pt2 | null =
     if (ref.role === 'p2') return { x: x[o + 2], y: x[o + 3] };
   } else if (s.type === 'circle') {
     if (ref.role === 'center') return { x: x[o], y: x[o + 1] };
-  } else if (s.type === 'rect') {
+  } else if (s.type === 'arc') {
+    const acx = x[o];
+    const acy = x[o + 1];
+    const ar = x[o + 2];
+    const sA = x[o + 3];
+    const eA = x[o + 4];
+    if (ref.role === 'center') return { x: acx, y: acy };
+    if (ref.role === 'p1') return { x: acx + ar * Math.cos(sA), y: acy + ar * Math.sin(sA) };
+    if (ref.role === 'p2') return { x: acx + ar * Math.cos(eA), y: acy + ar * Math.sin(eA) };
+  } else if (s.type === 'rect' || s.type === 'rounded-rect') {
     const rx = x[o];
     const ry = x[o + 1];
     const w = x[o + 2];
@@ -226,7 +291,7 @@ const getLineEnds = (
       p2: { x: x[o + 2], y: x[o + 3] },
     };
   }
-  if (ref.kind === 'edge' && s.type === 'rect') {
+  if (ref.kind === 'edge' && (s.type === 'rect' || s.type === 'rounded-rect')) {
     const rx = x[o];
     const ry = x[o + 1];
     const w = x[o + 2];
@@ -255,6 +320,27 @@ const signedPerpDist = (
   return ((p.x - line.p1.x) * dy - (p.y - line.p1.y) * dx) / len;
 };
 
+/** Read (center, radius) for a `circle` ref. Treats `arc` shapes as circles
+ *  for tangency / radius constraints — they share the center + radius
+ *  parameters. Returns null when the ref doesn't point at a circle / arc. */
+const getCircle = (
+  ref: EntityRef,
+  x: Float64Array,
+  layout: Layout
+): { center: Pt2; radius: number } | null => {
+  if (ref.kind !== 'circle') return null;
+  const b = blockOf(ref, layout);
+  if (!b) return null;
+  const o = b.offset;
+  if (b.shape.type === 'circle') {
+    return { center: { x: x[o], y: x[o + 1] }, radius: x[o + 2] };
+  }
+  if (b.shape.type === 'arc') {
+    return { center: { x: x[o], y: x[o + 1] }, radius: x[o + 2] };
+  }
+  return null;
+};
+
 // ────────────────────────────────────────────────────────────────────────────
 // Residuals
 // ────────────────────────────────────────────────────────────────────────────
@@ -281,19 +367,34 @@ const residualOf = (c: Constraint, x: Float64Array, layout: Layout): number[] =>
       return [a.x - b.x, a.y - b.y];
     }
     case 'distance': {
-      // Perpendicular distance between two lines (or rect edges). When the
-      // pair is parallel — which the picker enforces at creation — the
-      // perpendicular distance from a's midpoint to b matches the actual
-      // line-to-line gap. abs() so the constraint stays positive regardless
-      // of which side of B point A sits on.
+      // Three pairings are supported:
+      //   line + line: perpendicular distance from midpoint(a) onto b. The
+      //     creator enforces parallelism so this matches the gap.
+      //   point + line: perpendicular distance from the point onto the line.
+      //   point + point: euclidean distance between the two points.
       const lineA = getLineEnds(c.a, x, layout);
       const lineB = getLineEnds(c.b, x, layout);
-      if (!lineA || !lineB) return [];
-      const midA = {
-        x: (lineA.p1.x + lineA.p2.x) / 2,
-        y: (lineA.p1.y + lineA.p2.y) / 2,
-      };
-      return [Math.abs(signedPerpDist(midA, lineB)) - c.value];
+      if (lineA && lineB) {
+        const midA = {
+          x: (lineA.p1.x + lineA.p2.x) / 2,
+          y: (lineA.p1.y + lineA.p2.y) / 2,
+        };
+        return [Math.abs(signedPerpDist(midA, lineB)) - c.value];
+      }
+      const pointA = getPoint(c.a, x, layout);
+      const pointB = getPoint(c.b, x, layout);
+      if (pointA && pointB) {
+        const dx = pointA.x - pointB.x;
+        const dy = pointA.y - pointB.y;
+        return [Math.hypot(dx, dy) - c.value];
+      }
+      if (pointA && lineB) {
+        return [Math.abs(signedPerpDist(pointA, lineB)) - c.value];
+      }
+      if (lineA && pointB) {
+        return [Math.abs(signedPerpDist(pointB, lineA)) - c.value];
+      }
+      return [];
     }
     case 'length': {
       const e = getLineEnds(c.ref, x, layout);
@@ -301,6 +402,42 @@ const residualOf = (c: Constraint, x: Float64Array, layout: Layout): number[] =>
       const dx = e.p2.x - e.p1.x;
       const dy = e.p2.y - e.p1.y;
       return [dx * dx + dy * dy - c.value * c.value];
+    }
+    case 'radius': {
+      // Pin a circle's (or arc's) radius. Layout: [cx, cy, r, …].
+      const b = blockOf(c.ref, layout);
+      if (
+        !b ||
+        c.ref.kind !== 'circle' ||
+        (b.shape.type !== 'circle' && b.shape.type !== 'arc')
+      )
+        return [];
+      return [x[b.offset + 2] - c.value];
+    }
+    case 'tangent': {
+      // Tangency between a line/edge and a circle/arc: the perpendicular
+      // distance from the circle center to the line equals the radius.
+      // The Sketcher normalizes refs so `a` is the line/edge and `b` is
+      // the circle, but we accept either ordering for robustness.
+      let lineRef: EntityRef = c.a;
+      let circleRef: EntityRef = c.b;
+      if (lineRef.kind === 'circle') {
+        lineRef = c.b;
+        circleRef = c.a;
+      }
+      const line = getLineEnds(lineRef, x, layout);
+      const cir = getCircle(circleRef, x, layout);
+      if (!line || !cir) return [];
+      const d = Math.abs(signedPerpDist(cir.center, line));
+      return [d - cir.radius];
+    }
+    case 'coord-x': {
+      const p = getPoint(c.ref, x, layout);
+      return p ? [p.x - c.value] : [];
+    }
+    case 'coord-y': {
+      const p = getPoint(c.ref, x, layout);
+      return p ? [p.y - c.value] : [];
     }
     default:
       return []; // unimplemented in P1
@@ -430,13 +567,26 @@ const TOL = 1e-7;
 
 export const solve = (
   shapes: SketcherShape[],
-  constraints: Constraint[]
+  constraints: Constraint[],
+  /** Shape ids whose parameters must stay fixed during solving. Used for
+   *  imported face geometry — the user can constrain to face edges, but the
+   *  edges themselves can't move. */
+  lockedShapeIds?: ReadonlySet<string>
 ): SolveResult => {
   if (constraints.length === 0) {
     return { shapes, converged: true, iters: 0, residual: 0 };
   }
   const layout = makeLayout(shapes);
   let x = packShapes(shapes, layout);
+  // Indices in the parameter vector that should not be modified.
+  const lockedParams = new Set<number>();
+  if (lockedShapeIds && lockedShapeIds.size > 0) {
+    for (const id of lockedShapeIds) {
+      const block = layout.blocks.get(id);
+      if (!block) continue;
+      for (let i = 0; i < block.count; i++) lockedParams.add(block.offset + i);
+    }
+  }
   let f = residualVector(constraints, x, layout);
   let normSq = residualNormSq(f);
   if (normSq < TOL * TOL) {
@@ -453,6 +603,10 @@ export const solve = (
       lambda *= 10;
       if (lambda > 1e12) break;
       continue;
+    }
+    // Project the step onto the free subspace by zeroing locked params.
+    if (lockedParams.size > 0) {
+      for (const i of lockedParams) dx[i] = 0;
     }
     const xNew = new Float64Array(x.length);
     for (let i = 0; i < x.length; i++) xNew[i] = x[i] + dx[i];
@@ -476,6 +630,30 @@ export const solve = (
     residual: Math.sqrt(normSq),
   };
 };
+
+/**
+ * Compute the L2 norm of each constraint's residual vector at the current
+ * shape state. Used by the constraints panel to surface which specific
+ * constraints are unsatisfied (residual ≫ TOL) after a solve. The order of
+ * the returned array matches `constraints`.
+ */
+export const constraintResiduals = (
+  shapes: SketcherShape[],
+  constraints: Constraint[]
+): { id: string; residual: number }[] => {
+  const layout = makeLayout(shapes);
+  const x = packShapes(shapes, layout);
+  return constraints.map((c) => {
+    const r = residualOf(c, x, layout);
+    let s = 0;
+    for (const v of r) s += v * v;
+    return { id: c.id, residual: Math.sqrt(s) };
+  });
+};
+
+/** Tolerance below which a constraint is considered satisfied. Mirrors the
+ *  solver's internal tolerance, exposed for UI checks. */
+export const RESIDUAL_TOL = TOL;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Selection-validity helpers (used by the toolbar to enable/disable buttons)
@@ -513,12 +691,29 @@ export const canCreate = (type: ConstraintType, refs: EntityRef[]): boolean => {
       return refs[0].kind === 'circle';
     case 'coincident':
       return isPoint(refs[0]) && isPoint(refs[1]);
-    case 'distance':
-      // Line / rect-edge pair only. The Sketcher additionally enforces
-      // parallelism (geometric or via a `parallel` constraint) before
-      // creating the constraint — the residual is perpendicular distance
-      // and only makes sense on parallel pairs.
-      return isLineish(refs[0]) && isLineish(refs[1]);
+    case 'distance': {
+      // Three valid pairings (Sketcher enforces parallelism for line+line):
+      //   line + line   → perpendicular distance between parallel lines
+      //   point + point → euclidean distance
+      //   point + line  → perpendicular distance from point onto line
+      const a = refs[0];
+      const b = refs[1];
+      const aL = isLineish(a);
+      const bL = isLineish(b);
+      const aP = isPoint(a);
+      const bP = isPoint(b);
+      return (aL && bL) || (aP && bP) || (aP && bL) || (aL && bP);
+    }
+    case 'tangent': {
+      // Tangent needs exactly one line/edge + one circle (or arc).
+      const a = refs[0];
+      const b = refs[1];
+      const aL = isLineish(a);
+      const bL = isLineish(b);
+      const aC = a.kind === 'circle';
+      const bC = b.kind === 'circle';
+      return (aL && bC) || (aC && bL);
+    }
     default:
       return false;
   }

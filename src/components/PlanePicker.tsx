@@ -9,7 +9,12 @@ export interface PickedPlane {
   preset: PlaneName | 'FACE';
   origin: [number, number, number];
   xDir: [number, number, number];
+  /** Plane normal as sent to the kernel. For face-derived planes this can
+   *  point inward when needed to keep `xDir` along a positive world axis. */
   normal: [number, number, number];
+  /** True outward direction (away from the solid). Optional for non-face
+   *  planes; defaults to `normal` when absent. */
+  outwardNormal?: [number, number, number];
 }
 
 interface Props {
@@ -20,10 +25,28 @@ interface Props {
   resetSignal: number;
 }
 
+// Preset rotations chosen so that each plane's local +Z (which becomes the
+// plane's outward normal in OpenCascade) points the way a CAD user expects:
+//   XY (top):    normal = world +Z   — "top" view, looking down at the floor
+//   XZ (front):  normal = world -Y   — "front" view, looking from -Y
+//   YZ (right):  normal = world +X   — "right" view, looking from +X
+// These pair with the canonical xDir choices in `fireChange` so that
+// OpenCascade's derived yDir (= normal × xDir) ends up along world +Z (or
+// world +Y for top/bottom faces) and the sketcher matches the 3D view.
 const PRESET_ROT: Record<PlaneName, [number, number, number]> = {
   XY: [0, 0, 0],
-  XZ: [-Math.PI / 2, 0, 0],
+  XZ: [Math.PI / 2, 0, 0],
   YZ: [0, Math.PI / 2, 0],
+};
+
+// Canonical world axis to use as the sketch's +x for each preset, before
+// projection onto the (possibly rotated) plane. Top/front planes prefer +X
+// as "right"; the right/left side planes prefer +Y so sketch up still maps
+// to +Z (right-handed with the outward normal).
+const PRESET_XAXIS: Record<PlaneName, [number, number, number]> = {
+  XY: [1, 0, 0],
+  XZ: [1, 0, 0],
+  YZ: [0, 1, 0],
 };
 
 const COLORS: Record<PlaneName, string> = {
@@ -150,37 +173,35 @@ export function PlanePicker({ selected, onSelect, transformMode, onChange, reset
   const fireChange = (name: PlaneName, obj: THREE.Object3D) => {
     obj.updateWorldMatrix(true, false);
     const wq = obj.getWorldQuaternion(new THREE.Quaternion());
+    const wPos = obj.getWorldPosition(new THREE.Vector3());
 
-    // The sketcher's X axis runs along the "bottom" edge of the plane and the
-    // origin sits at that edge's midpoint. Bottom = the edge whose midpoint has
-    // the lowest world Z; tie-break (e.g. for the horizontal XY plane) by
-    // picking the edge with the smallest local Y (its "front" edge), so the
-    // result is deterministic regardless of plane orientation.
-    const edges = [
-      { localMid: new THREE.Vector3(0, HALF, 0), localDir: new THREE.Vector3(1, 0, 0) },
-      { localMid: new THREE.Vector3(0, -HALF, 0), localDir: new THREE.Vector3(1, 0, 0) },
-      { localMid: new THREE.Vector3(HALF, 0, 0), localDir: new THREE.Vector3(0, 1, 0) },
-      { localMid: new THREE.Vector3(-HALF, 0, 0), localDir: new THREE.Vector3(0, 1, 0) },
-    ];
-    let best = edges[0];
-    let bestWorldMid = best.localMid.clone().applyMatrix4(obj.matrixWorld);
-    let bestKeyZ = bestWorldMid.z;
-    let bestKeyLocalY = best.localMid.y;
-    for (const e of edges) {
-      const w = e.localMid.clone().applyMatrix4(obj.matrixWorld);
-      const closeZ = Math.abs(w.z - bestKeyZ) < 1e-3;
-      if (w.z < bestKeyZ - 1e-3 || (closeZ && e.localMid.y < bestKeyLocalY)) {
-        best = e;
-        bestWorldMid = w;
-        bestKeyZ = w.z;
-        bestKeyLocalY = e.localMid.y;
-      }
-    }
-    const xDir = best.localDir.clone().applyQuaternion(wq).normalize();
+    // Plane normal is the local +Z rotated to world.
     const normal = new THREE.Vector3(0, 0, 1).applyQuaternion(wq).normalize();
+
+    // Sketch origin: the world origin projected onto the plane. For default
+    // presets (planes through the world origin) this stays at (0,0,0) so the
+    // sketch coordinate system anchors to the world origin. After the user
+    // translates the plane, the origin tracks the closest point on the plane
+    // to (0,0,0).
+    const offset = normal.dot(wPos); // signed distance from world origin to plane
+    const origin = new THREE.Vector3(0, 0, 0).addScaledVector(normal, offset);
+
+    // Sketch +x: project the canonical world axis (per preset) onto the
+    // plane. Falls back to a cross-product if the canonical axis is parallel
+    // to the normal (defensive for user-rotated planes).
+    const canonicalRaw = PRESET_XAXIS[name];
+    let xDir = new THREE.Vector3(canonicalRaw[0], canonicalRaw[1], canonicalRaw[2]);
+    xDir.addScaledVector(normal, -xDir.dot(normal));
+    if (xDir.lengthSq() < 1e-6) {
+      const fallback = Math.abs(normal.x) > 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+      fallback.addScaledVector(normal, -fallback.dot(normal));
+      xDir = fallback;
+    }
+    xDir.normalize();
+
     onChange({
       preset: name,
-      origin: [round3(bestWorldMid.x), round3(bestWorldMid.y), round3(bestWorldMid.z)],
+      origin: [round3(origin.x), round3(origin.y), round3(origin.z)],
       xDir: [round3(xDir.x), round3(xDir.y), round3(xDir.z)],
       normal: [round3(normal.x), round3(normal.y), round3(normal.z)],
     });

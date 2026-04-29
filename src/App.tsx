@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { Canvas, useThree } from '@react-three/fiber';
-import { OrbitControls, Grid } from '@react-three/drei';
+import { OrbitControls, Grid, GizmoHelper, GizmoViewport } from '@react-three/drei';
 import * as THREE from 'three';
-import { Layers, Box, Download, Trash2, Pencil, Move3d, Rotate3d, RefreshCw, X, Check, Save as SaveIcon, FolderOpen, Info, Eye, EyeOff } from 'lucide-react';
+import { Layers, Box, Download, Trash2, Pencil, Move3d, Rotate3d, RefreshCw, X, Check, Save as SaveIcon, FolderOpen, Info, Eye, EyeOff, AlertTriangle } from 'lucide-react';
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate';
 import { Sketcher, opShapesToSketcher } from './components/Sketcher';
 import type { SketcherShape } from './components/Sketcher';
@@ -23,7 +23,11 @@ interface Operation {
 interface FaceMeta {
   faceId: number;
   origin: [number, number, number];
+  /** Plane normal sent to OpenCascade — may be flipped from the outward
+   *  normal so the sketch's xDir lands on a positive world axis. */
   normal: [number, number, number];
+  /** True outward normal of the face (always points away from the solid). */
+  outwardNormal: [number, number, number];
   xDir: [number, number, number];
   isPlanar: boolean;
   triangleStart: number;
@@ -188,6 +192,10 @@ function Viewport({
           <lineBasicMaterial color="#ffffff" transparent opacity={0.5} />
         </lineSegments>
       </group>
+      {/* drei's Grid lies on XZ (its local Y is +world-Y) by default. Rotate
+          90° around +X so the grid sits on the XY plane (Z = 0) — matching
+          the Z-up CAD convention used by the plane picker labels and the
+          box / sketch_extrude pipeline. */}
       <Grid
         infiniteGrid
         cellSize={1}
@@ -196,6 +204,7 @@ function Viewport({
         fadeStrength={1.5}
         cellColor="#334155"
         sectionColor="#3b82f6"
+        rotation={[Math.PI / 2, 0, 0]}
       />
       <OrbitControls makeDefault />
     </>
@@ -420,6 +429,12 @@ function EdgeHover({
 function App() {
   const [history, setHistory] = useState<Operation[]>([]);
   const [meshData, setMeshData] = useState<any>(null);
+  // Per-op build outcome from the worker. Lets the sidebar badge ops the
+  // user may want to clean up after removing an upstream op (face anchor
+  // gone, fillet/chamfer matched no edge, etc.).
+  const [opDiagnostics, setOpDiagnostics] = useState<
+    Record<string, 'ok' | 'no-effect' | 'face-missing' | 'invalid'>
+  >({});
   const [sketches, setSketches] = useState<SketchData[]>([]);
   const [selectedSketchId, setSelectedSketchId] = useState<string | null>(null);
   const [faceMeta, setFaceMeta] = useState<Record<number, FaceMeta>>({});
@@ -547,7 +562,7 @@ function App() {
 
   const workerRef = useRef<Worker | null>(null);
   const buildingRef = useRef(false);
-  const pendingHistoryRef = useRef<Operation[] | null>(null);
+  const pendingHistoryRef = useRef<{ history: Operation[]; preview: boolean } | null>(null);
 
   useEffect(() => {
     workerRef.current = new Worker(new URL('./worker/cad-worker.ts', import.meta.url), {
@@ -564,24 +579,32 @@ function App() {
           workerRef.current?.postMessage({ type: 'BUILD', payload: { history } });
         }
       } else if (type === 'BUILD_SUCCESS') {
+        const isPreview = !!payload.preview;
         setMeshData({ faces: payload.faces, edges: payload.edges });
         setSketches(payload.sketches ?? []);
-        setFaceMeta(payload.faceMeta ?? {});
-        setEdgeMeta(payload.edgeMeta ?? {});
-        // Drop the face selection if the previously selected face no longer exists.
-        setSelectedFace((prev) => {
-          if (!prev) return null;
-          const meta = (payload.faceMeta ?? {})[prev.faceId];
-          return meta ?? null;
-        });
-        setSelectedEdgeIds((prev) =>
-          prev.filter((id) => (payload.edgeMeta ?? {})[id])
-        );
+        // Preview builds skip face/edge meta to save time during a depth
+        // drag — keep the previous meta so face/edge picking still works
+        // after the drag ends without an extra build round-trip. The
+        // following non-preview build refreshes them.
+        if (!isPreview) {
+          setFaceMeta(payload.faceMeta ?? {});
+          setEdgeMeta(payload.edgeMeta ?? {});
+          setOpDiagnostics(payload.diagnostics ?? {});
+          // Drop the face selection if the previously selected face no longer exists.
+          setSelectedFace((prev) => {
+            if (!prev) return null;
+            const meta = (payload.faceMeta ?? {})[prev.faceId];
+            return meta ?? null;
+          });
+          setSelectedEdgeIds((prev) =>
+            prev.filter((id) => (payload.edgeMeta ?? {})[id])
+          );
+        }
         buildingRef.current = false;
         if (pendingHistoryRef.current) {
           const next = pendingHistoryRef.current;
           pendingHistoryRef.current = null;
-          handleBuild(next);
+          handleBuild(next.history, { preview: next.preview });
         }
       } else if (type === 'BUILD_ERROR') {
         console.error('Build Error:', payload);
@@ -609,14 +632,29 @@ function App() {
     };
   }, []);
 
-  const handleBuild = (currentHistory: Operation[]) => {
+  const handleBuild = (
+    currentHistory: Operation[],
+    opts: { preview?: boolean } = {}
+  ) => {
     if (!workerRef.current || !isWorkerReady) return;
+    const preview = !!opts.preview;
     if (buildingRef.current) {
-      pendingHistoryRef.current = currentHistory;
+      // Coalesce: keep the latest pending. If a non-preview build is pending,
+      // never let a preview overwrite it (we want the final crisp build to
+      // reach the worker). Otherwise just store the latest history.
+      const existing = pendingHistoryRef.current;
+      if (existing && !existing.preview && preview) {
+        existing.history = currentHistory;
+      } else {
+        pendingHistoryRef.current = { history: currentHistory, preview };
+      }
       return;
     }
     buildingRef.current = true;
-    workerRef.current.postMessage({ type: 'BUILD', payload: { history: currentHistory } });
+    workerRef.current.postMessage({
+      type: 'BUILD',
+      payload: { history: currentHistory, preview },
+    });
   };
 
   const handleExport = (format: 'STEP' | 'STL' | '3MF') => {
@@ -660,18 +698,34 @@ function App() {
 
   const editSketchOp = (op: Operation) => {
     if (op.type !== 'sketch_extrude') return;
+    // Prefer the LIVE plane / outline resolved by the worker on the most
+    // recent build. For face-anchored sketches this picks up upstream
+    // edits (e.g. resized parent box) instead of using the stale snapshot
+    // baked into op.params.plane.
+    const live = sketches.find((s) => s.id === op.id);
     const planeSpec = op.params.plane;
-    if (planeSpec) {
+    const useLive = !!live && planeSpec?.preset === 'FACE';
+    if (useLive && live) {
+      setPickedPlane({
+        preset: 'FACE',
+        origin: live.planeOrigin,
+        xDir: live.planeXDir,
+        normal: live.planeNormal,
+        outwardNormal: live.planeOutwardNormal ?? live.planeNormal,
+      });
+      setSketchReference(live.referenceOutline ?? op.params.referenceOutline ?? null);
+    } else if (planeSpec) {
       setPickedPlane({
         preset: planeSpec.preset ?? 'XY',
         origin: planeSpec.origin,
         xDir: planeSpec.xDir,
         normal: planeSpec.normal,
       });
+      setSketchReference(op.params.referenceOutline ?? null);
     } else {
       setPickedPlane(null);
+      setSketchReference(op.params.referenceOutline ?? null);
     }
-    setSketchReference(op.params.referenceOutline ?? null);
     setEditingShapes(opShapesToSketcher(op.params.shapes ?? []));
     setEditingConstraints(Array.isArray(op.params.constraints) ? op.params.constraints : []);
     setEditingOpId(op.id);
@@ -690,6 +744,31 @@ function App() {
       return prev.length === 1 && prev[0] === edgeId ? [] : [edgeId];
     });
   };
+
+  // Length of the shortest currently-selected edge — used by the EdgeHUD
+  // to surface a max-radius hint. The fillet radius shouldn't exceed half
+  // the shortest edge or OpenCASCADE will produce overlapping surfaces.
+  // Computed by walking each selected edge's polyline samples.
+  const shortestSelectedEdgeLength = useMemo<number | null>(() => {
+    const lines: number[] | undefined = meshData?.edges?.lines;
+    if (!lines || selectedEdgeIds.length === 0) return null;
+    let best = Infinity;
+    for (const id of selectedEdgeIds) {
+      const meta = edgeMeta[id];
+      if (!meta || meta.vertexCount < 2) continue;
+      let len = 0;
+      for (let i = 1; i < meta.vertexCount; i++) {
+        const a = (meta.vertexStart + i - 1) * 3;
+        const b = (meta.vertexStart + i) * 3;
+        const dx = lines[b] - lines[a];
+        const dy = lines[b + 1] - lines[a + 1];
+        const dz = lines[b + 2] - lines[a + 2];
+        len += Math.hypot(dx, dy, dz);
+      }
+      if (len > 0 && len < best) best = len;
+    }
+    return Number.isFinite(best) ? best : null;
+  }, [selectedEdgeIds, edgeMeta, meshData]);
 
   const applyEdgeOp = (kind: 'fillet' | 'chamfer') => {
     if (selectedEdgeIds.length === 0 || !(filletValue > 0)) return;
@@ -713,18 +792,37 @@ function App() {
 
   const selectEdgesOfFace = () => {
     if (!selectedFace || !selectedFace.isPlanar) return;
-    // An edge belongs to the face when its midpoint lies on the face's plane.
+    // An edge belongs to the face only when *every* sampled vertex of the
+    // edge lies on the face's plane. Testing only the midpoint mistakenly
+    // included vertical edges of an extrusion: their start vertex sits on
+    // the top plane while the end sits on the bottom, and depending on
+    // sample count the "middle" sample can land near the top, slipping
+    // under the eps threshold. Walking the full polyline rejects any edge
+    // that leaves the plane at any point.
+    const lines: number[] | undefined = meshData?.edges?.lines;
+    if (!lines) return;
     const eps = 0.01;
+    const nx = selectedFace.normal[0];
+    const ny = selectedFace.normal[1];
+    const nz = selectedFace.normal[2];
+    const ox = selectedFace.origin[0];
+    const oy = selectedFace.origin[1];
+    const oz = selectedFace.origin[2];
     const fIds: number[] = [];
     for (const edge of Object.values(edgeMeta)) {
-      const dx = edge.midpoint[0] - selectedFace.origin[0];
-      const dy = edge.midpoint[1] - selectedFace.origin[1];
-      const dz = edge.midpoint[2] - selectedFace.origin[2];
-      const d =
-        dx * selectedFace.normal[0] +
-        dy * selectedFace.normal[1] +
-        dz * selectedFace.normal[2];
-      if (Math.abs(d) < eps) fIds.push(edge.edgeId);
+      let onPlane = true;
+      for (let i = 0; i < edge.vertexCount; i++) {
+        const idx = (edge.vertexStart + i) * 3;
+        const dx = lines[idx] - ox;
+        const dy = lines[idx + 1] - oy;
+        const dz = lines[idx + 2] - oz;
+        const d = dx * nx + dy * ny + dz * nz;
+        if (Math.abs(d) > eps) {
+          onPlane = false;
+          break;
+        }
+      }
+      if (onPlane) fIds.push(edge.edgeId);
     }
     setSelectedFace(null);
     setSelectedEdgeIds(fIds);
@@ -737,6 +835,7 @@ function App() {
       origin: selectedFace.origin,
       xDir: selectedFace.xDir,
       normal: selectedFace.normal,
+      outwardNormal: selectedFace.outwardNormal,
     });
     setSketchReference(selectedFace.boundary ?? null);
     setSelectedFace(null);
@@ -761,7 +860,13 @@ function App() {
 
   const handleSaveSketch = (shapes: any[], constraints: any[] = []) => {
     const plane = pickedPlane
-      ? { origin: pickedPlane.origin, xDir: pickedPlane.xDir, normal: pickedPlane.normal, preset: pickedPlane.preset }
+      ? {
+          origin: pickedPlane.origin,
+          xDir: pickedPlane.xDir,
+          normal: pickedPlane.normal,
+          outwardNormal: pickedPlane.outwardNormal ?? pickedPlane.normal,
+          preset: pickedPlane.preset,
+        }
       : undefined;
     let newHistory: Operation[];
     let resultId: string;
@@ -809,7 +914,7 @@ function App() {
     handleBuild(newHistory);
   };
 
-  const updateSketchDepth = (opId: string, depth: number) => {
+  const updateSketchDepth = (opId: string, depth: number, final: boolean = true) => {
     // When the user drags the depth handle out of a fresh sketch (prev depth
     // was 0 and they haven't picked Extrude/Pocket yet), pick a sensible mode
     // automatically based on direction:
@@ -831,7 +936,11 @@ function App() {
       return { ...op, params };
     });
     setHistory(newHistory);
-    handleBuild(newHistory);
+    // Mid-drag (`final === false`): use a coarse "preview" build — the
+    // worker uses a coarser tessellation tolerance and skips face/edge
+    // meta. On release the SketchGhost calls us again with `final=true`,
+    // triggering a full-quality build that refreshes face picking.
+    handleBuild(newHistory, { preview: !final });
   };
 
   const startExtrudeOrPocket = (opId: string, mode: 'add' | 'pocket') => {
@@ -863,11 +972,14 @@ function App() {
   };
 
   const removeOperation = (id: string) => {
-    // Cascade delete: removing an op also drops every later op, since downstream
-    // operations may reference faces / edges / shapes that the deleted op produced.
+    // Single-op delete. Downstream ops are NOT removed — the worker is
+    // tolerant (face anchors re-resolve against the new model, fillet /
+    // chamfer per-edge errors are caught) so most chains keep working.
+    // Ops that genuinely depended on the removed one are flagged in the
+    // sidebar via `opDiagnostics` so the user can decide what to clean up.
     const idx = history.findIndex((op) => op.id === id);
     if (idx === -1) return;
-    const newHistory = history.slice(0, idx);
+    const newHistory = history.filter((op) => op.id !== id);
     setHistory(newHistory);
     setSelectedSketchId(null);
     setSelectedFace(null);
@@ -931,11 +1043,29 @@ function App() {
           </div>
 
           <div className="space-y-2">
-            {history.map((op, index) => (
+            {history.map((op, index) => {
+              // After the recent "remove only this op" change, downstream
+              // ops can end up no-ops or unanchored. The worker reports
+              // the per-op outcome; flag anything other than "ok" so the
+              // user can decide whether to clean it up. A fresh sketch
+              // with depth=0 is reported as 'ok' by the worker so we
+              // don't false-positive on it.
+              const status = opDiagnostics[op.id] ?? 'ok';
+              const warning =
+                status === 'face-missing'
+                  ? "This sketch's face is gone. The op no longer has a target — remove or re-create it."
+                  : status === 'no-effect'
+                  ? 'This op has no effect on the current model. Likely depending on geometry that was removed upstream.'
+                  : status === 'invalid'
+                  ? `This ${op.type} produced invalid geometry — the radius/distance is too large for the local shape (the corner doesn't have enough material). Try reducing the value or selecting fewer edges.`
+                  : null;
+              return (
               <div
                 key={op.id}
                 className={`group rounded-lg p-3 hover:bg-slate-700/50 transition-all shadow-sm border ${
-                  op.type === 'sketch_extrude'
+                  warning
+                    ? 'bg-amber-900/15 border-amber-600/40 border-l-4 border-l-amber-500 hover:border-amber-500/60'
+                    : op.type === 'sketch_extrude'
                     ? 'bg-blue-900/15 border-blue-500/30 border-l-4 border-l-blue-500/70 hover:border-blue-500/60'
                     : 'bg-slate-700/30 border-slate-700/50 hover:border-blue-500/50'
                 }`}
@@ -943,6 +1073,11 @@ function App() {
                 <div className="flex items-center justify-between mb-3">
                   <span className="font-semibold text-slate-200 flex items-center gap-2">
                     <span className="w-5 h-5 bg-slate-600 rounded flex items-center justify-center text-[10px] text-slate-300">{index + 1}</span>
+                    {warning && (
+                      <span title={warning} className="text-amber-400">
+                        <AlertTriangle size={14} />
+                      </span>
+                    )}
                     {op.type === 'sketch_extrude'
                       ? (op.params.depth && Math.abs(op.params.depth) > 1e-6
                           ? (op.params.mode === 'pocket'
@@ -1077,7 +1212,8 @@ function App() {
                   )}
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
 
           <button
@@ -1155,7 +1291,7 @@ function App() {
       {/* Main Viewport */}
       <div className="flex-1 relative bg-[#0f172a]">
         <Canvas
-          camera={{ position: [30, 30, 30], fov: 45 }}
+          camera={{ position: [30, -30, 30], up: [0, 0, 1], fov: 45 }}
           raycaster={{ params: { Line: { threshold: 1.5 }, Mesh: {}, Points: { threshold: 1 }, LOD: {}, Sprite: {} } as any }}
           onPointerMissed={() => {
             setSelectedSketchId(null);
@@ -1168,6 +1304,16 @@ function App() {
           <pointLight position={[20, 20, 20]} intensity={1} />
           <pointLight position={[-20, -20, -20]} intensity={0.5} />
           <CameraFit signal={cameraFitSignal} target={cameraFitTarget} />
+          {/* World axes: small triad at the origin (red=X, green=Y, blue=Z) so
+              the user can correlate sketcher reference axes with the 3D view. */}
+          <axesHelper args={[8]} renderOrder={500} />
+          {/* Corner gizmo that always shows orientation regardless of pan/zoom. */}
+          <GizmoHelper alignment="bottom-right" margin={[60, 60]}>
+            <GizmoViewport
+              axisColors={['#ef4444', '#22c55e', '#3b82f6']}
+              labelColor="#0f172a"
+            />
+          </GizmoHelper>
           <Viewport
             meshData={meshData}
             faceMeta={faceMeta}
@@ -1204,7 +1350,9 @@ function App() {
                     setSelectedSketchId(s.id);
                     setSelectedFace(null);
                   }}
-                  onDepthCommit={(d) => updateSketchDepth(s.id, d)}
+                  onDepthCommit={(d, final) =>
+                    updateSketchDepth(s.id, d, final ?? true)
+                  }
                 />
               );
             })}
@@ -1247,6 +1395,7 @@ function App() {
             onFillet={() => applyEdgeOp('fillet')}
             onChamfer={() => applyEdgeOp('chamfer')}
             onCancel={() => setSelectedEdgeIds([])}
+            shortestEdgeLength={shortestSelectedEdgeLength}
           />
         )}
 
@@ -1407,6 +1556,7 @@ function EdgeHUD({
   onFillet,
   onChamfer,
   onCancel,
+  shortestEdgeLength,
 }: {
   count: number;
   value: number;
@@ -1414,7 +1564,21 @@ function EdgeHUD({
   onFillet: () => void;
   onChamfer: () => void;
   onCancel: () => void;
+  /** Length of the shortest currently-selected edge in mm. The HUD uses
+   *  this to suggest a maximum safe radius; the fillet algorithm tends
+   *  to fail above ~half the shortest edge. */
+  shortestEdgeLength?: number | null;
 }) {
+  // Conservative cap. OpenCASCADE typically fails when the radius exceeds
+  // the curvature limits of the local geometry; half the shortest edge is
+  // a useful first-order bound. The hint is advisory — the user can still
+  // try larger values; the worker will catch and revert bad results.
+  const maxSuggested =
+    typeof shortestEdgeLength === 'number' && shortestEdgeLength > 0
+      ? shortestEdgeLength * 0.5
+      : null;
+  const exceedsHint =
+    maxSuggested != null && value > maxSuggested;
   return (
     <div className="absolute top-6 right-6 w-72 bg-slate-800/95 backdrop-blur-md border border-slate-700/60 rounded-xl shadow-2xl overflow-hidden">
       <div className="px-4 py-3 border-b border-slate-700 flex items-center justify-between">
@@ -1439,9 +1603,24 @@ function EdgeHUD({
             step="0.5"
             value={value}
             onChange={(e) => onValueChange(parseFloat(e.target.value) || 0)}
-            className="w-20 px-2 py-1 bg-slate-900/60 border border-slate-700 rounded text-slate-200 font-mono text-right text-xs focus:outline-none focus:border-blue-500"
+            className={`w-20 px-2 py-1 bg-slate-900/60 border rounded font-mono text-right text-xs focus:outline-none ${
+              exceedsHint
+                ? 'border-amber-500 text-amber-200 focus:border-amber-400'
+                : 'border-slate-700 text-slate-200 focus:border-blue-500'
+            }`}
           />
         </label>
+        {maxSuggested != null && (
+          <div
+            className={`text-[10px] font-mono ${
+              exceedsHint ? 'text-amber-400' : 'text-slate-500'
+            }`}
+            title="Half the shortest selected edge — beyond this OpenCASCADE often produces overlapping surfaces."
+          >
+            shortest edge {shortestEdgeLength!.toFixed(2)} mm · max suggested {maxSuggested.toFixed(2)} mm
+            {exceedsHint && ' — value too large'}
+          </div>
+        )}
         <div className="grid grid-cols-2 gap-2">
           <button
             onClick={onFillet}
