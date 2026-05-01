@@ -32,3 +32,7 @@ A push to `main` runs `.github/workflows/deploy.yml`, which builds the Vite
 bundle and publishes it to GitHub Pages. The custom domain is set via
 `public/CNAME`; the workflow expects "Source: GitHub Actions" under the repo's
 Settings → Pages.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).

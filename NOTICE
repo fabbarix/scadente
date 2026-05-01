@@ -1,0 +1,21 @@
+Scadente
+Copyright 2026 Fabio Torchetti
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product bundles or links the following third-party software:
+
+- replicad (MIT) — https://github.com/sgenoud/replicad
+- replicad-opencascadejs (LGPL-2.1, with Open CASCADE Technology Public
+  License exception) — https://github.com/donalffons/opencascade.js
+- three.js (MIT) — https://github.com/mrdoob/three.js
+- @react-three/fiber, @react-three/drei (MIT)
+- React (MIT) — https://github.com/facebook/react
+- Konva, react-konva (MIT)
+- Tailwind CSS (MIT)
+- lucide-react (ISC)
+- fflate (MIT)
+- Vite (MIT)
+
+Each of those packages retains its own license; this NOTICE is informational
+and does not modify the LICENSE under which Scadente itself is distributed.
