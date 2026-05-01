@@ -1,73 +1,34 @@
-# React + TypeScript + Vite
+# Scadente
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A browser-based parametric CAD app. Sketches in 2D, extrudes / pockets / sweeps
+into 3D, runs entirely in the browser via [replicad](https://replicad.xyz/) and
+the OpenCASCADE WASM kernel — no backend.
 
-Currently, two official plugins are available:
+**Live: <http://scadente.orksu.com/>**
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Features
 
-## React Compiler
+- 2D sketcher (rect / rounded-rect / circle / arc / line / polyline) with
+  snapping, dimensions, and a constraint solver (horizontal, vertical,
+  coincident, distance, length, angle, tangent, …).
+- 3D operations: sketch + extrude / pocket, fillet, chamfer, sweep along an
+  edge.
+- History tree — every op is editable; downstream ops re-resolve face / edge
+  anchors against the live model.
+- Save / load `.scz` projects, export to STEP / STL / 3MF.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Develop
 
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```sh
+npm install
+npm run dev      # http://localhost:5173
+npm run build
+npm run lint
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Deploy
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+A push to `main` runs `.github/workflows/deploy.yml`, which builds the Vite
+bundle and publishes it to GitHub Pages. The custom domain is set via
+`public/CNAME`; the workflow expects "Source: GitHub Actions" under the repo's
+Settings → Pages.

@@ -1,0 +1,61 @@
+name: Deploy to GitHub Pages
+
+# Build and publish the Vite bundle to GitHub Pages on every push to main.
+# Manual runs are allowed via the Actions tab so the user can re-deploy
+# without a code change.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Pages deployment requires write access to `pages` and an OIDC token to
+# upload the artifact. `contents: read` is enough for the checkout step.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deployment can be in flight at a time. Cancel earlier
+# in-progress runs when a new commit lands so we always publish the tip
+# of `main`.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        # The Pages site is served from a custom domain (CNAME in
+        # public/), so assets live at the domain root — no `BASE_PATH`
+        # prefix needed. If the custom domain is removed and the site
+        # falls back to https://<owner>.github.io/<repo>/, set
+        # `BASE_PATH: ${{ github.event.repository.name }}` here.
+        run: npm run build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
