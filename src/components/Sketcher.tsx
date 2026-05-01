@@ -24,6 +24,8 @@ import {
   MoveVertical,
   Triangle,
   Info,
+  Maximize,
+  Minimize,
 } from 'lucide-react';
 import { solve, canCreate, arity, constraintResiduals, RESIDUAL_TOL } from './sketcher/constraints';
 import type { Constraint, ConstraintType, EntityRef } from './sketcher/constraints';
@@ -942,6 +944,27 @@ export function Sketcher({
     arcEnd?: EntityRef;
   }>({});
   const [size, setSize] = useState({ w: 800, h: 600 });
+  const [isFullscreen, setIsFullscreen] = useState(
+    typeof document !== 'undefined' && !!document.fullscreenElement
+  );
+
+  // Track real fullscreen state — the user can also exit via Esc or the
+  // browser's exit button, so we sync our toggle icon by listening to the
+  // fullscreenchange event rather than assuming our requestFullscreen()
+  // call is always the source of truth.
+  useEffect(() => {
+    const onChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', onChange);
+    return () => document.removeEventListener('fullscreenchange', onChange);
+  }, []);
+
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) {
+      document.exitFullscreen?.();
+    } else {
+      document.documentElement.requestFullscreen?.();
+    }
+  };
   const [view, setView] = useState({ panX: 0, panY: 0, zoom: 1 });
   const [snapHint, setSnapHint] = useState<SnapTarget | null>(null);
   const [inlineEditor, setInlineEditor] = useState<
@@ -976,6 +999,26 @@ export function Sketcher({
     ro.observe(el);
     setSize({ w: el.clientWidth, h: el.clientHeight });
     return () => ro.disconnect();
+  }, []);
+
+  // Lock the document body's scrolling and touch behavior while the
+  // Sketcher is mounted. Without this, on iPad Safari the Apple Pencil
+  // (and finger touch) trigger page-level scroll / rubber-band even
+  // though the canvas container itself has `touch-action: none`. We
+  // stash and restore the previous values so we don't trample any
+  // upstream scroll-locking logic from the App.
+  useEffect(() => {
+    const prevOverflow = document.body.style.overflow;
+    const prevTouch = document.body.style.touchAction;
+    const prevOverscroll = document.body.style.overscrollBehavior;
+    document.body.style.overflow = 'hidden';
+    document.body.style.touchAction = 'none';
+    document.body.style.overscrollBehavior = 'none';
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      document.body.style.touchAction = prevTouch;
+      document.body.style.overscrollBehavior = prevOverscroll;
+    };
   }, []);
 
   // Zoom-to-fit when the sketcher opens with a referenceOutline (sketching on
@@ -4728,6 +4771,18 @@ export function Sketcher({
             <div className="text-[11px] text-slate-500 truncate hidden md:block">{hint}</div>
           </div>
           <div className="flex gap-2 shrink-0">
+            <button
+              onClick={toggleFullscreen}
+              className="p-1.5 text-slate-400 hover:text-blue-300 hover:bg-slate-700/50 rounded transition-colors"
+              title={
+                isFullscreen
+                  ? 'Exit full screen'
+                  : 'Enter full screen — useful on iPad to hide Safari chrome'
+              }
+              aria-label={isFullscreen ? 'Exit full screen' : 'Enter full screen'}
+            >
+              {isFullscreen ? <Minimize size={14} /> : <Maximize size={14} />}
+            </button>
             <button
               onClick={onCancel}
               className="px-3 py-1.5 text-xs font-semibold rounded-md hover:bg-slate-700 text-slate-300"
