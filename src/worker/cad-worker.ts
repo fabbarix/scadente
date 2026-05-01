@@ -206,14 +206,19 @@ const computeFaceMeta = (faces: any): Record<number, FaceMetaPayload> => {
  *
  * Match criteria:
  *   1. Outward normal aligns within ~8° (dot ≥ 0.99).
- *   2. Among candidates with matching normals, pick the one whose
- *      *lateral* distance to the anchor origin is smallest — i.e. the
- *      displacement projected onto the plane perpendicular to the
- *      normal. Movement *along* the normal is allowed (and expected:
- *      it's what changing the upstream extrusion depth does), so the
- *      sketch follows the face up / down without the matcher rejecting
- *      it for being "off the plane".
- *   3. Reject candidates whose lateral distance exceeds
+ *   2. Lateral distance to the anchor origin (displacement projected
+ *      onto the plane perpendicular to the normal) is smallest.
+ *      Movement *along* the normal is allowed and expected — that's
+ *      what changing the upstream extrusion depth does, and the sketch
+ *      should follow the face up / down.
+ *   3. Tiebreaker for lateral ties: smallest |along-normal| distance.
+ *      Critical when several coplanar-but-stacked faces share the same
+ *      lateral position — e.g. the box's top face and a pocket's
+ *      bottom face both sit on the +Z axis with lateral 0 to a
+ *      cylinder anchored to the pocket bottom. Without this, iteration
+ *      order (faceId) decides, which deterministically picks the
+ *      box's top face since it was created first.
+ *   4. Reject candidates whose lateral distance exceeds
  *      `lateralTolMm` so unrelated faces with the same orientation
  *      (e.g. the bottom face of a separate solid added later) don't
  *      accidentally match.
@@ -226,8 +231,10 @@ const resolveFaceAnchor = (
   },
   lateralTolMm = 1000
 ): FaceMetaPayload | null => {
+  const LATERAL_EPS = 0.01;
   let best: FaceMetaPayload | null = null;
   let bestLateral = Infinity;
+  let bestAlongAbs = Infinity;
   for (const f of Object.values(meta)) {
     if (!f.isPlanar) continue;
     const dotN =
@@ -238,19 +245,22 @@ const resolveFaceAnchor = (
     const dx = anchor.origin[0] - f.origin[0];
     const dy = anchor.origin[1] - f.origin[1];
     const dz = anchor.origin[2] - f.origin[2];
-    // Component of the displacement along the face normal.
     const alongN =
       dx * f.outwardNormal[0] +
       dy * f.outwardNormal[1] +
       dz * f.outwardNormal[2];
-    // Lateral component = displacement minus the along-normal piece.
     const lx = dx - alongN * f.outwardNormal[0];
     const ly = dy - alongN * f.outwardNormal[1];
     const lz = dz - alongN * f.outwardNormal[2];
     const lateral = Math.hypot(lx, ly, lz);
     if (lateral > lateralTolMm) continue;
-    if (lateral < bestLateral) {
+    const alongAbs = Math.abs(alongN);
+    const better =
+      lateral < bestLateral - LATERAL_EPS ||
+      (Math.abs(lateral - bestLateral) <= LATERAL_EPS && alongAbs < bestAlongAbs);
+    if (better) {
       bestLateral = lateral;
+      bestAlongAbs = alongAbs;
       best = f;
     }
   }
