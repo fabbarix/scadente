@@ -204,10 +204,19 @@ const computeFaceMeta = (faces: any): Record<number, FaceMetaPayload> => {
  * (origin + outward normal). Used so face-anchored sketch_extrude ops can
  * pick up live geometry when an upstream op (e.g. the box dims) changes.
  *
- * Match criteria, in order of strictness:
+ * Match criteria:
  *   1. Outward normal aligns within ~8° (dot ≥ 0.99).
- *   2. Anchor origin lies within `planeTolMm` of the candidate's plane.
- *   3. Tie-breaker: smallest 3D distance from anchor origin to face centroid.
+ *   2. Among candidates with matching normals, pick the one whose
+ *      *lateral* distance to the anchor origin is smallest — i.e. the
+ *      displacement projected onto the plane perpendicular to the
+ *      normal. Movement *along* the normal is allowed (and expected:
+ *      it's what changing the upstream extrusion depth does), so the
+ *      sketch follows the face up / down without the matcher rejecting
+ *      it for being "off the plane".
+ *   3. Reject candidates whose lateral distance exceeds
+ *      `lateralTolMm` so unrelated faces with the same orientation
+ *      (e.g. the bottom face of a separate solid added later) don't
+ *      accidentally match.
  */
 const resolveFaceAnchor = (
   meta: Record<number, FaceMetaPayload>,
@@ -215,10 +224,10 @@ const resolveFaceAnchor = (
     origin: [number, number, number];
     outwardNormal: [number, number, number];
   },
-  planeTolMm = 5
+  lateralTolMm = 1000
 ): FaceMetaPayload | null => {
   let best: FaceMetaPayload | null = null;
-  let bestCentroidDist = Infinity;
+  let bestLateral = Infinity;
   for (const f of Object.values(meta)) {
     if (!f.isPlanar) continue;
     const dotN =
@@ -229,13 +238,19 @@ const resolveFaceAnchor = (
     const dx = anchor.origin[0] - f.origin[0];
     const dy = anchor.origin[1] - f.origin[1];
     const dz = anchor.origin[2] - f.origin[2];
-    const planeDist = Math.abs(
-      dx * f.outwardNormal[0] + dy * f.outwardNormal[1] + dz * f.outwardNormal[2]
-    );
-    if (planeDist > planeTolMm) continue;
-    const centroidDist = Math.hypot(dx, dy, dz);
-    if (centroidDist < bestCentroidDist) {
-      bestCentroidDist = centroidDist;
+    // Component of the displacement along the face normal.
+    const alongN =
+      dx * f.outwardNormal[0] +
+      dy * f.outwardNormal[1] +
+      dz * f.outwardNormal[2];
+    // Lateral component = displacement minus the along-normal piece.
+    const lx = dx - alongN * f.outwardNormal[0];
+    const ly = dy - alongN * f.outwardNormal[1];
+    const lz = dz - alongN * f.outwardNormal[2];
+    const lateral = Math.hypot(lx, ly, lz);
+    if (lateral > lateralTolMm) continue;
+    if (lateral < bestLateral) {
+      bestLateral = lateral;
       best = f;
     }
   }
