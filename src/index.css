@@ -1,1 +1,15 @@
 @import "tailwindcss";
+
+/* Scadente is a single-screen app — there's no page-level scroll. On
+   iPad / iOS Safari, leaving the body scrollable causes the pencil and
+   touch input to rubber-band the page when the user drags Three.js
+   gizmo handles (sketch-depth arrow, sweep edge handles, OrbitControls
+   pan). Lock the body to remove that behavior across the whole app;
+   the Sketcher stacks an additional lock for parity with browsers that
+   apply different defaults inside iframes / modals. */
+html,
+body {
+  overflow: hidden;
+  overscroll-behavior: none;
+  touch-action: none;
+}

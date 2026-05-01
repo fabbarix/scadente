@@ -4631,13 +4631,13 @@ export function Sketcher({
   const ToolBtn = ({ name, icon, label }: { name: Tool; icon: any; label: string }) => (
     <button
       onClick={() => switchTool(name)}
-      className={`px-3 py-1.5 rounded-md flex items-center gap-2 text-xs font-semibold transition-colors ${
+      className={`p-2 rounded-md flex items-center justify-center transition-colors ${
         tool === name ? 'bg-blue-600 text-white shadow' : 'text-slate-300 hover:bg-slate-600'
       }`}
       title={label}
+      aria-label={label}
     >
       {icon}
-      <span className="hidden sm:inline">{label}</span>
     </button>
   );
 
