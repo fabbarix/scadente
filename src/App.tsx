@@ -1667,7 +1667,7 @@ function App() {
                     {(op.type === 'sketch_extrude' || op.type === 'sweep') && (
                       <button
                         onClick={() => editSketchOp(op)}
-                        className="p-1 text-slate-500 hover:text-blue-300 hover:bg-blue-400/10 rounded opacity-0 group-hover:opacity-100 transition-all"
+                        className="p-1 text-slate-500 hover:text-blue-300 hover:bg-blue-400/10 rounded transition-colors"
                         title="Edit sketch"
                       >
                         <Pencil size={14} />
@@ -1675,7 +1675,7 @@ function App() {
                     )}
                     <button
                       onClick={() => removeOperation(op.id)}
-                      className="p-1 text-slate-600 hover:text-red-400 hover:bg-red-400/10 rounded opacity-0 group-hover:opacity-100 transition-all"
+                      className="p-1 text-slate-600 hover:text-red-400 hover:bg-red-400/10 rounded transition-colors"
                     >
                       <Trash2 size={14} />
                     </button>
