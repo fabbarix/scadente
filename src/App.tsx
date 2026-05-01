@@ -811,6 +811,8 @@ function App() {
     (window as any).__SCADENTE = {
       get history() { return history; },
       setHistory,
+      setMode,
+      setPickedPlane,
       handleBuild,
       postBuild: (h: Operation[]) => {
         if (!workerRef.current) return false;

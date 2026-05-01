@@ -23,6 +23,7 @@ import {
   MoveHorizontal,
   MoveVertical,
   Triangle,
+  Info,
 } from 'lucide-react';
 import { solve, canCreate, arity, constraintResiduals, RESIDUAL_TOL } from './sketcher/constraints';
 import type { Constraint, ConstraintType, EntityRef } from './sketcher/constraints';
@@ -2467,7 +2468,10 @@ export function Sketcher({
   };
 
   // ---- Pointer handlers ----
-  const onMouseDown = (e: any) => {
+  // Unified pointer handlers — fire for mouse, touch, and pen (Apple
+  // Pencil included). iOS Safari does NOT fire mouse events for pen
+  // input, so handling `onPointerDown` is required for iPad usage.
+  const onPointerDown = (e: any) => {
     const stage = e.target.getStage();
     // Middle-button pan (or right-button as a fallback for trackpad users)
     if (e.evt?.button === 1 || e.evt?.button === 2) {
@@ -2688,7 +2692,7 @@ export function Sketcher({
     }
   };
 
-  const onMouseMove = (e: any) => {
+  const onPointerMove = (e: any) => {
     if (isPanningRef.current && panStartRef.current) {
       // Snapshot before the async setView callback runs — by the time
       // React invokes the updater, the ref may have been cleared (mouse
@@ -2857,7 +2861,7 @@ export function Sketcher({
     }
   };
 
-  const onMouseUp = () => {
+  const onPointerUp = () => {
     if (isPanningRef.current) {
       isPanningRef.current = false;
       panStartRef.current = null;
@@ -3260,7 +3264,7 @@ export function Sketcher({
           stroke={strokeFor(s, isSelected)}
           strokeWidth={sw}
           dash={dashFor(s)}
-          onMouseDown={select}
+          onPointerDown={select}
           onTap={select}
           draggable={tool === 'select' && !pinnedShapeIds.has(s.id)}
           onDragStart={() => setSelectedId(s.id)}
@@ -3318,7 +3322,7 @@ export function Sketcher({
           stroke={strokeFor(s, isSelected)}
           strokeWidth={sw}
           dash={dashFor(s)}
-          onMouseDown={select}
+          onPointerDown={select}
           onTap={select}
           draggable={tool === 'select' && !pinnedShapeIds.has(s.id)}
           onDragStart={() => setSelectedId(s.id)}
@@ -3355,7 +3359,7 @@ export function Sketcher({
           stroke={strokeFor(s, isSelected)}
           strokeWidth={sw}
           dash={dashFor(s)}
-          onMouseDown={select}
+          onPointerDown={select}
           onTap={select}
           draggable={tool === 'select' && !pinnedShapeIds.has(s.id)}
           onDragStart={() => setSelectedId(s.id)}
@@ -3402,7 +3406,7 @@ export function Sketcher({
           // The body is open (innerR === outerR) so Konva's fill is empty;
           // hit detection still works on the stroke.
           hitStrokeWidth={6 / screenScale}
-          onMouseDown={select}
+          onPointerDown={select}
           onTap={select}
         />
       );
@@ -3418,7 +3422,7 @@ export function Sketcher({
           dash={isFrozen ? undefined : [2 / screenScale, 2 / screenScale]}
           opacity={isFrozen ? 0.85 : 1}
           hitStrokeWidth={6 / screenScale}
-          onMouseDown={select}
+          onPointerDown={select}
           onTap={select}
           onDblClick={
             isFrozen
@@ -3445,7 +3449,7 @@ export function Sketcher({
           strokeWidth={sw}
           dash={s.closed ? closedDash : [2 / screenScale, 2 / screenScale]}
           hitStrokeWidth={6 / screenScale}
-          onMouseDown={select}
+          onPointerDown={select}
           onTap={select}
         />
       );
@@ -3472,7 +3476,7 @@ export function Sketcher({
         stroke="#3b82f6"
         strokeWidth={1 / screenScale}
         draggable
-        onMouseDown={(e: any) => {
+        onPointerDown={(e: any) => {
           e.cancelBubble = true;
         }}
         onDragMove={(e) => {
@@ -4119,7 +4123,7 @@ export function Sketcher({
           stroke={stroke}
           strokeWidth={widthSel}
           hitStrokeWidth={8}
-          onMouseDown={(e: any) => {
+          onPointerDown={(e: any) => {
             e.cancelBubble = true;
             const stage = e.target.getStage();
             const p = stage.getPointerPosition();
@@ -4179,7 +4183,7 @@ export function Sketcher({
           fontSize={11}
           fontFamily="ui-monospace, monospace"
           fill={stroke}
-          onMouseDown={(e: any) => {
+          onPointerDown={(e: any) => {
             e.cancelBubble = true;
             const stage = e.target.getStage();
             const p = stage.getPointerPosition();
@@ -4677,15 +4681,30 @@ export function Sketcher({
   })();
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/80 backdrop-blur-md">
-      <div className="bg-slate-800 border border-slate-700 rounded-xl shadow-2xl w-[92vw] h-[92vh] flex flex-col overflow-hidden">
+    <div className="fixed inset-0 z-50 bg-slate-800 flex flex-col overflow-hidden">
+      {/* Full-screen sketcher — the modal frame is gone so the toolbar
+          has the entire viewport width to lay out tools and constraint
+          buttons without wrapping. */}
         {/* Header / Toolbar */}
         <div className="px-4 py-3 border-b border-slate-700 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3 min-w-0">
             <h2 className="text-lg font-bold pr-3 border-r border-slate-700 whitespace-nowrap">2D Sketcher</h2>
             {plane && (
-              <div className="text-[10px] font-mono text-slate-300 bg-slate-700/60 border border-slate-600/40 px-2 py-1 rounded">
-                on {plane.preset} · ({plane.origin.map((n) => (Math.abs(n) < 0.001 ? '0' : n.toFixed(1))).join(', ')})
+              <div className="relative group">
+                {/* Info button replaces the inline plane readout. The
+                    full text appears in a popover on hover / tap so it
+                    only takes ~24px in the header. */}
+                <button
+                  type="button"
+                  className="p-1.5 text-slate-400 hover:text-blue-300 hover:bg-slate-700/50 rounded transition-colors"
+                  title="Sketch plane"
+                  aria-label="Sketch plane info"
+                >
+                  <Info size={14} />
+                </button>
+                <div className="absolute left-0 top-full mt-1 z-10 hidden group-hover:block group-focus-within:block bg-slate-900/95 border border-slate-600/40 text-[10px] font-mono text-slate-300 px-2 py-1 rounded shadow-lg whitespace-nowrap">
+                  on {plane.preset} · ({plane.origin.map((n) => (Math.abs(n) < 0.001 ? '0' : n.toFixed(1))).join(', ')})
+                </div>
               </div>
             )}
             <div className="flex bg-slate-700/50 rounded-md p-1 gap-1">
@@ -4726,14 +4745,22 @@ export function Sketcher({
 
         <div className="flex-1 flex overflow-hidden">
           {/* Canvas */}
-          <div ref={containerRef} className="flex-1 bg-slate-900 relative overflow-hidden">
+          <div
+            ref={containerRef}
+            // `touch-action: none` keeps iOS Safari from hijacking
+            // pen / touch events for page-scroll gestures, so the
+            // Apple Pencil draws on the canvas instead of trying to
+            // pan the page. Mouse and trackpad behavior unchanged.
+            style={{ touchAction: 'none' }}
+            className="flex-1 bg-slate-900 relative overflow-hidden"
+          >
             <Stage
               width={size.w}
               height={size.h}
-              onMouseDown={onMouseDown}
-              onMouseMove={onMouseMove}
-              onMouseUp={onMouseUp}
-              onMouseLeave={() => {
+              onPointerDown={onPointerDown}
+              onPointerMove={onPointerMove}
+              onPointerUp={onPointerUp}
+              onPointerLeave={() => {
                 isPanningRef.current = false;
                 panStartRef.current = null;
                 setSnapHint(null);
@@ -5018,7 +5045,6 @@ export function Sketcher({
             </div>
           </div>
         </div>
-      </div>
     </div>
   );
 }
