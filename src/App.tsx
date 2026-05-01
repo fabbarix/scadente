@@ -11,7 +11,7 @@ import type { PickedPlane, PlaneName } from './components/PlanePicker';
 import { SketchGhost } from './components/SketchGhost';
 import type { SketchData } from './components/SketchGhost';
 
-type OperationType = 'box' | 'sketch_extrude' | 'fillet' | 'chamfer';
+type OperationType = 'box' | 'sketch_extrude' | 'fillet' | 'chamfer' | 'sweep';
 type Mode = 'idle' | 'pick-plane' | 'sketching';
 
 interface Operation {
@@ -200,8 +200,12 @@ function Viewport({
         infiniteGrid
         cellSize={1}
         sectionSize={10}
-        fadeDistance={400}
-        fadeStrength={1.5}
+        // Push the fade distance far past anything the user is likely to
+        // model, and zero out the strength so the grid stays uniformly
+        // opaque. The default fade was small enough that the grid
+        // disappeared right around the model and read as "fog".
+        fadeDistance={10000}
+        fadeStrength={0}
         cellColor="#334155"
         sectionColor="#3b82f6"
         rotation={[Math.PI / 2, 0, 0]}
@@ -214,6 +218,13 @@ function Viewport({
 interface CameraFitTarget {
   center: [number, number, number];
   radius: number;
+  /** Unit vector from `center` toward the camera. When omitted the
+   *  current camera direction is preserved (existing fit-to-sketch
+   *  behavior). When provided, the camera snaps to this orientation —
+   *  used by the Top / Front / Left / etc. quick-view buttons. */
+  direction?: [number, number, number];
+  /** Camera up vector in world coords. Pair with `direction`. */
+  up?: [number, number, number];
 }
 
 function CameraFit({
@@ -238,7 +249,10 @@ function CameraFit({
     const distance = (radius * 1.5) / Math.sin(fovRad / 2);
     const center = new THREE.Vector3(...target.center);
     let dir: THREE.Vector3;
-    if (controls?.target) {
+    if (target.direction) {
+      // Quick-view snap: camera lands exactly along the requested axis.
+      dir = new THREE.Vector3(...target.direction);
+    } else if (controls?.target) {
       dir = cam.position.clone().sub(controls.target);
     } else {
       dir = cam.position.clone();
@@ -248,8 +262,18 @@ function CameraFit({
     }
     dir.normalize();
     cam.position.copy(center).addScaledVector(dir, distance);
-    cam.near = Math.max(0.1, distance / 1000);
-    cam.far = distance * 10;
+    if (target.up) {
+      cam.up.set(target.up[0], target.up[1], target.up[2]);
+    }
+    // Generous near/far bounds. Tying these tightly to the current
+    // distance (e.g. distance/1000 / distance*10) clips geometry the
+    // moment the user orbits closer than `distance` or the model grows
+    // past `10×distance` — the symptom is a "blue veil" of the far face
+    // showing through after the near face is clipped away. Hard
+    // constants keep depth-buffer precision adequate for our mm-scale
+    // scenes (sub-millimeter z-fighting only matters very close up).
+    cam.near = 0.5;
+    cam.far = 100000;
     cam.updateProjectionMatrix();
     cam.lookAt(center);
     if (controls?.target) {
@@ -423,6 +447,124 @@ function EdgeHover({
     <lineSegments ref={ref} renderOrder={550}>
       <lineBasicMaterial color="#7dd3fc" linewidth={2} depthTest={false} transparent opacity={0.85} />
     </lineSegments>
+  );
+}
+
+/**
+ * Small isometric-cube glyph with one face highlighted to indicate which
+ * orthographic view it represents. Drawn as plain SVG paths so it matches
+ * Lucide's stroke aesthetic without dragging in a 3D dependency.
+ *
+ * Top / Front / Right are the cube's natural visible faces in the
+ * standard iso projection (top-up). For Bot / Back / Left we mirror or
+ * flip the projection so the requested face moves into view, which
+ * keeps the highlighted face always front-and-center.
+ */
+function ViewCubeIcon({
+  view,
+  size = 18,
+}: {
+  view: 'top' | 'bottom' | 'front' | 'back' | 'left' | 'right';
+  size?: number;
+}) {
+  // Standard iso cube vertices in 24×24 viewBox. The 8 corners of a
+  // unit cube are projected with a 30° iso tilt so the top face shows
+  // as a flat rhombus on top.
+  // Vertex indices: 0..3 = bottom (lo y), 4..7 = top (hi y).
+  // Visible faces in the default projection: top (4-5-6-7),
+  // front (1-2-6-5), right (2-3-7-6).
+  const ISO_VERTS: [number, number][] = [
+    [4, 14],   // 0 back-left bottom
+    [12, 18],  // 1 front-left bottom
+    [20, 14],  // 2 front-right bottom
+    [12, 10],  // 3 back-right bottom
+    [4, 8],    // 4 back-left top
+    [12, 12],  // 5 front-left top
+    [20, 8],   // 6 front-right top
+    [12, 4],   // 7 back-right top
+  ];
+  // Pick which face highlights and how to read the visible faces. For
+  // bottom / back / left we transform the vertex set so the requested
+  // face becomes one of the three visible faces, then highlight it.
+  const transform = (v: [number, number]): [number, number] => {
+    if (view === 'bottom') return [v[0], 24 - v[1]];   // flip vertically
+    if (view === 'back') return [24 - v[0], v[1]];     // flip horizontally
+    if (view === 'left') return [24 - v[0], v[1]];     // mirror so right→left
+    return v;
+  };
+  const verts = ISO_VERTS.map(transform);
+  const path = (idxs: number[]) =>
+    idxs.map((i, k) => `${k === 0 ? 'M' : 'L'}${verts[i][0]} ${verts[i][1]}`).join(' ') + 'Z';
+  // Each visible face is drawn outlined; the active one gets a fill.
+  const TOP_FACE = [4, 5, 6, 7];
+  const FRONT_FACE = [1, 2, 6, 5];
+  const RIGHT_FACE = [2, 3, 7, 6];
+  // After the transform, the highlighted face slot maps as follows:
+  //   top      → top face slot
+  //   bottom   → top face slot (cube was flipped)
+  //   front    → front face slot
+  //   back     → front face slot (cube was rotated)
+  //   right    → right face slot
+  //   left     → right face slot (cube was mirrored)
+  const highlight =
+    view === 'top' || view === 'bottom'
+      ? TOP_FACE
+      : view === 'front' || view === 'back'
+      ? FRONT_FACE
+      : RIGHT_FACE;
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeLinejoin="round"
+      strokeLinecap="round"
+    >
+      <path d={path(TOP_FACE)} />
+      <path d={path(FRONT_FACE)} />
+      <path d={path(RIGHT_FACE)} />
+      <path
+        d={path(highlight)}
+        fill="currentColor"
+        fillOpacity={0.85}
+        stroke="none"
+      />
+    </svg>
+  );
+}
+
+function ViewBtn({
+  view,
+  label,
+  onClick,
+}: {
+  view: 'top' | 'bottom' | 'front' | 'back' | 'left' | 'right';
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={`${label} view — fits the solid`}
+      className="
+        flex flex-col items-center justify-center gap-0.5 py-2
+        rounded-md text-slate-300
+        bg-white/5 hover:bg-blue-500/30
+        border border-white/10 hover:border-blue-300/40
+        backdrop-blur-md
+        shadow-[0_4px_18px_rgba(0,0,0,0.35)]
+        hover:text-white
+        transition-colors
+      "
+    >
+      <ViewCubeIcon view={view} />
+      <span className="text-[9px] font-bold uppercase tracking-wider leading-none">
+        {label}
+      </span>
+    </button>
   );
 }
 
@@ -657,6 +799,36 @@ function App() {
     });
   };
 
+  // Dev hook: expose a couple of slots on window for in-browser scripted
+  // testing (e.g. from Chrome DevTools). Lets a script construct a custom
+  // history and post it through the worker without having to drive every
+  // button click. `postBuild` posts directly to the worker, bypassing
+  // handleBuild's coalescing + isWorkerReady guard so tests can issue a
+  // build the moment the worker reports INITIALIZED. Gated to dev so
+  // production bundles don't expose internal state on `window`.
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    (window as any).__SCADENTE = {
+      get history() { return history; },
+      setHistory,
+      handleBuild,
+      postBuild: (h: Operation[]) => {
+        if (!workerRef.current) return false;
+        buildingRef.current = true;
+        workerRef.current.postMessage({
+          type: 'BUILD',
+          payload: { history: h, preview: false },
+        });
+        return true;
+      },
+      get isWorkerReady() { return isWorkerReady; },
+      get edgeMeta() { return edgeMeta; },
+      get faceMeta() { return faceMeta; },
+      get meshData() { return meshData; },
+      get opDiagnostics() { return opDiagnostics; },
+    };
+  });
+
   const handleExport = (format: 'STEP' | 'STL' | '3MF') => {
     if (!workerRef.current || !isWorkerReady) return;
     const map = { STEP: 'EXPORT_STEP', STL: 'EXPORT_STL', '3MF': 'EXPORT_3MF' } as const;
@@ -681,6 +853,66 @@ function App() {
     setMode('pick-plane');
   };
 
+  /**
+   * Snap the camera to a canonical viewing direction (top / bottom / front /
+   * back / left / right) and frame the current solid. Z-up convention:
+   *   - top      cam at +Z, looking -Z
+   *   - bottom   cam at -Z, looking +Z
+   *   - front    cam at -Y, looking +Y
+   *   - back     cam at +Y, looking -Y
+   *   - right    cam at +X, looking -X
+   *   - left     cam at -X, looking +X
+   * Up vector is +Z for the side views and +Y for the top / bottom views.
+   */
+  const VIEW_DIRECTIONS: Record<
+    'top' | 'bottom' | 'front' | 'back' | 'left' | 'right',
+    {
+      direction: [number, number, number];
+      up: [number, number, number];
+    }
+  > = {
+    top: { direction: [0, 0, 1], up: [0, 1, 0] },
+    bottom: { direction: [0, 0, -1], up: [0, 1, 0] },
+    front: { direction: [0, -1, 0], up: [0, 0, 1] },
+    back: { direction: [0, 1, 0], up: [0, 0, 1] },
+    right: { direction: [1, 0, 0], up: [0, 0, 1] },
+    left: { direction: [-1, 0, 0], up: [0, 0, 1] },
+  };
+
+  const snapToView = (view: keyof typeof VIEW_DIRECTIONS) => {
+    // Pull the current solid's bounding box from the meshed vertices so
+    // the framing tracks whatever's actually built. Falls back to the
+    // world origin with a 50 mm sphere when nothing is loaded yet.
+    const verts: number[] | undefined = meshData?.faces?.vertices;
+    let center: [number, number, number] = [0, 0, 0];
+    let radius = 50;
+    if (verts && verts.length >= 3) {
+      let minX = Infinity, minY = Infinity, minZ = Infinity;
+      let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+      for (let i = 0; i + 2 < verts.length; i += 3) {
+        const x = verts[i];
+        const y = verts[i + 1];
+        const z = verts[i + 2];
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (z < minZ) minZ = z;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+        if (z > maxZ) maxZ = z;
+      }
+      if (Number.isFinite(minX)) {
+        center = [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2];
+        radius = Math.max(
+          1,
+          0.5 * Math.hypot(maxX - minX, maxY - minY, maxZ - minZ)
+        );
+      }
+    }
+    const v = VIEW_DIRECTIONS[view];
+    setCameraFitTarget({ center, radius, direction: v.direction, up: v.up });
+    setCameraFitSignal((s) => s + 1);
+  };
+
   const continueToSketcher = () => {
     if (!pickedPlane) return;
     setMode('sketching');
@@ -694,10 +926,11 @@ function App() {
     setEditingOpId(null);
     setEditingShapes(null);
     setEditingConstraints(null);
+    sweepPendingRef.current = null;
   };
 
   const editSketchOp = (op: Operation) => {
-    if (op.type !== 'sketch_extrude') return;
+    if (op.type !== 'sketch_extrude' && op.type !== 'sweep') return;
     // Prefer the LIVE plane / outline resolved by the worker on the most
     // recent build. For face-anchored sketches this picks up upstream
     // edits (e.g. resized parent box) instead of using the stale snapshot
@@ -705,7 +938,69 @@ function App() {
     const live = sketches.find((s) => s.id === op.id);
     const planeSpec = op.params.plane;
     const useLive = !!live && planeSpec?.preset === 'FACE';
-    if (useLive && live) {
+    if (op.type === 'sweep') {
+      // Re-derive the plane from the live edge so profile edits land on
+      // a fresh perpendicular even if the surrounding solid changed.
+      const anchor = op.params.edgeAnchor;
+      const eps = 0.05;
+      let matchEdgeId: number | null = null;
+      if (anchor?.midpoint) {
+        for (const [idStr, m] of Object.entries(edgeMeta)) {
+          const dx = m.midpoint[0] - anchor.midpoint[0];
+          const dy = m.midpoint[1] - anchor.midpoint[1];
+          const dz = m.midpoint[2] - anchor.midpoint[2];
+          if (Math.hypot(dx, dy, dz) < eps) {
+            matchEdgeId = Number(idStr);
+            break;
+          }
+        }
+      }
+      let resolvedPlane: {
+        origin: [number, number, number];
+        xDir: [number, number, number];
+        normal: [number, number, number];
+        outwardNormal: [number, number, number];
+      } | null = null;
+      if (matchEdgeId != null) {
+        const plane = deriveSweepPlane(matchEdgeId);
+        if (plane) {
+          resolvedPlane = {
+            origin: plane.origin,
+            xDir: plane.xDir,
+            normal: plane.normal,
+            outwardNormal: plane.outwardNormal,
+          };
+        }
+      }
+      if (!resolvedPlane && planeSpec) {
+        resolvedPlane = {
+          origin: planeSpec.origin,
+          xDir: planeSpec.xDir,
+          normal: planeSpec.normal,
+          outwardNormal: planeSpec.outwardNormal ?? planeSpec.normal,
+        };
+      }
+      if (resolvedPlane) {
+        setPickedPlane({
+          preset: 'EDGE_START',
+          origin: resolvedPlane.origin,
+          xDir: resolvedPlane.xDir,
+          normal: resolvedPlane.normal,
+          outwardNormal: resolvedPlane.outwardNormal,
+        });
+        // Refresh the silhouette from the current model so any upstream
+        // edit (resized parent, added feature) shows up in the backdrop.
+        setSketchReference(
+          sliceModelByPlane(
+            resolvedPlane.origin,
+            resolvedPlane.normal,
+            resolvedPlane.xDir
+          ) ?? op.params.referenceOutline ?? null
+        );
+      } else {
+        setSketchReference(op.params.referenceOutline ?? null);
+      }
+    } else if (useLive && live) {
       setPickedPlane({
         preset: 'FACE',
         origin: live.planeOrigin,
@@ -828,6 +1123,233 @@ function App() {
     setSelectedEdgeIds(fIds);
   };
 
+  /**
+   * Slice the current solid's tessellation with a plane and return the
+   * resulting cross-section as a flat array of 2D segments in plane-local
+   * coordinates `[x1, y1, x2, y2, …]` — the same shape the Sketcher
+   * already consumes as `referenceOutline`. Used to give the Sketcher a
+   * silhouette of the solid at the edge being swept along, so the user
+   * can see where their profile sits relative to the existing geometry.
+   *
+   * Implemented as a per-triangle plane / triangle intersection: for each
+   * triangle, find which of its three edges cross the plane (sign change
+   * of signed distance) and project the two intersection points into the
+   * plane's 2D basis. Two crossings per cut triangle → one segment.
+   * Triangles entirely on one side contribute nothing. Triangles with a
+   * vertex exactly on the plane are handled by treating that vertex as
+   * strictly positive (negligible visual artifact).
+   */
+  const sliceModelByPlane = (
+    origin: [number, number, number],
+    normal: [number, number, number],
+    xDir: [number, number, number]
+  ): number[] | null => {
+    const verts: number[] | undefined = meshData?.faces?.vertices;
+    const tris: number[] | undefined = meshData?.faces?.triangles;
+    if (!verts || !tris || tris.length < 3) return null;
+    // y-basis of the sketch plane = normal × xDir.
+    const yAxis: [number, number, number] = [
+      normal[1] * xDir[2] - normal[2] * xDir[1],
+      normal[2] * xDir[0] - normal[0] * xDir[2],
+      normal[0] * xDir[1] - normal[1] * xDir[0],
+    ];
+    const signedDist = (i: number): number => {
+      const dx = verts[i * 3] - origin[0];
+      const dy = verts[i * 3 + 1] - origin[1];
+      const dz = verts[i * 3 + 2] - origin[2];
+      return dx * normal[0] + dy * normal[1] + dz * normal[2];
+    };
+    const proj2D = (
+      i: number,
+      t: number,
+      j: number
+    ): [number, number] => {
+      const x = verts[i * 3] + t * (verts[j * 3] - verts[i * 3]);
+      const y = verts[i * 3 + 1] + t * (verts[j * 3 + 1] - verts[i * 3 + 1]);
+      const z = verts[i * 3 + 2] + t * (verts[j * 3 + 2] - verts[i * 3 + 2]);
+      const dx = x - origin[0];
+      const dy = y - origin[1];
+      const dz = z - origin[2];
+      const u = dx * xDir[0] + dy * xDir[1] + dz * xDir[2];
+      const v = dx * yAxis[0] + dy * yAxis[1] + dz * yAxis[2];
+      return [u, v];
+    };
+    const out: number[] = [];
+    const cross = (i: number, j: number, di: number, dj: number) => {
+      if ((di <= 0 && dj > 0) || (di > 0 && dj <= 0)) {
+        const t = di / (di - dj);
+        return proj2D(i, t, j);
+      }
+      return null;
+    };
+    for (let t = 0; t + 2 < tris.length; t += 3) {
+      const a = tris[t];
+      const b = tris[t + 1];
+      const c = tris[t + 2];
+      const da = signedDist(a);
+      const db = signedDist(b);
+      const dc = signedDist(c);
+      const pts: ([number, number] | null)[] = [
+        cross(a, b, da, db),
+        cross(b, c, db, dc),
+        cross(c, a, dc, da),
+      ];
+      const hits = pts.filter((p): p is [number, number] => p !== null);
+      if (hits.length === 2) {
+        out.push(hits[0][0], hits[0][1], hits[1][0], hits[1][1]);
+      }
+    }
+    return out.length ? out : null;
+  };
+
+  /**
+   * Build the perpendicular sketch plane attached to the start of an edge,
+   * for the sweep operation. The plane's normal is the edge's tangent at
+   * its first sample (so the profile lies in a plane orthogonal to the
+   * sweep direction). The X-axis is derived as follows:
+   *
+   *   1. If any planar face's plane contains every sampled vertex of the
+   *      edge, use that face's outward normal as the up direction
+   *      (face-aligned). This is the natural case for sweeping a profile
+   *      that should "sit on" the face.
+   *   2. Otherwise project world-Z onto the perpendicular plane. If the
+   *      tangent is near-parallel to Z, fall back to world-Y.
+   *
+   * Returns null when the edge isn't picked or its sample data is missing.
+   */
+  const deriveSweepPlane = (
+    edgeId: number
+  ): {
+    origin: [number, number, number];
+    xDir: [number, number, number];
+    normal: [number, number, number];
+    outwardNormal: [number, number, number];
+    tangent: [number, number, number];
+    upHint: [number, number, number];
+    midpoint: [number, number, number];
+  } | null => {
+    const lines: number[] | undefined = meshData?.edges?.lines;
+    const meta = edgeMeta[edgeId];
+    if (!lines || !meta || meta.vertexCount < 2) return null;
+    const startIdx = meta.vertexStart * 3;
+    const nextIdx = (meta.vertexStart + 1) * 3;
+    const origin: [number, number, number] = [
+      lines[startIdx],
+      lines[startIdx + 1],
+      lines[startIdx + 2],
+    ];
+    const tx = lines[nextIdx] - lines[startIdx];
+    const ty = lines[nextIdx + 1] - lines[startIdx + 1];
+    const tz = lines[nextIdx + 2] - lines[startIdx + 2];
+    const tlen = Math.hypot(tx, ty, tz);
+    if (tlen < 1e-9) return null;
+    const tangent: [number, number, number] = [tx / tlen, ty / tlen, tz / tlen];
+    // Look for a planar face that contains every sampled vertex of this
+    // edge — same membership test selectEdgesOfFace uses (vertices are
+    // on the face's plane within eps).
+    const eps = 0.05;
+    let upHint: [number, number, number] | null = null;
+    for (const f of Object.values(faceMeta)) {
+      if (!f.isPlanar) continue;
+      let onPlane = true;
+      for (let i = 0; i < meta.vertexCount; i++) {
+        const idx = (meta.vertexStart + i) * 3;
+        const dx = lines[idx] - f.origin[0];
+        const dy = lines[idx + 1] - f.origin[1];
+        const dz = lines[idx + 2] - f.origin[2];
+        const d =
+          dx * f.normal[0] + dy * f.normal[1] + dz * f.normal[2];
+        if (Math.abs(d) > eps) {
+          onPlane = false;
+          break;
+        }
+      }
+      if (onPlane) {
+        upHint = f.outwardNormal;
+        break;
+      }
+    }
+    if (!upHint) {
+      // World-Z fallback (or world-Y if tangent is nearly parallel to Z).
+      const dotZ = Math.abs(tangent[2]);
+      upHint = dotZ > 0.95 ? [0, 1, 0] : [0, 0, 1];
+    }
+    // Project upHint onto the plane perpendicular to tangent: xDir = up - (up·t)t.
+    const dot =
+      upHint[0] * tangent[0] +
+      upHint[1] * tangent[1] +
+      upHint[2] * tangent[2];
+    let xx = upHint[0] - dot * tangent[0];
+    let xy = upHint[1] - dot * tangent[1];
+    let xz = upHint[2] - dot * tangent[2];
+    let xlen = Math.hypot(xx, xy, xz);
+    if (xlen < 1e-6) {
+      // up was parallel to tangent — pick any orthogonal vector.
+      const fallback: [number, number, number] =
+        Math.abs(tangent[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+      const d2 =
+        fallback[0] * tangent[0] +
+        fallback[1] * tangent[1] +
+        fallback[2] * tangent[2];
+      xx = fallback[0] - d2 * tangent[0];
+      xy = fallback[1] - d2 * tangent[1];
+      xz = fallback[2] - d2 * tangent[2];
+      xlen = Math.hypot(xx, xy, xz);
+    }
+    const xDir: [number, number, number] = [xx / xlen, xy / xlen, xz / xlen];
+    return {
+      origin,
+      xDir,
+      normal: tangent,
+      outwardNormal: tangent,
+      tangent,
+      upHint,
+      midpoint: meta.midpoint,
+    };
+  };
+
+  // The pending sweep — captured when the user clicks `Sweep along edge`
+  // in the EdgeHUD. The Sketcher reads this to know which edge to anchor
+  // the new sweep op to on save. Cleared when leaving the sketcher.
+  const sweepPendingRef = useRef<{
+    edgeId: number;
+    midpoint: [number, number, number];
+    tangentHint: [number, number, number];
+    upHint: [number, number, number];
+  } | null>(null);
+
+  const sweepAlongSelectedEdge = () => {
+    if (selectedEdgeIds.length !== 1) return;
+    const edgeId = selectedEdgeIds[0];
+    const plane = deriveSweepPlane(edgeId);
+    if (!plane) return;
+    sweepPendingRef.current = {
+      edgeId,
+      midpoint: plane.midpoint,
+      tangentHint: plane.tangent,
+      upHint: plane.upHint,
+    };
+    setPickedPlane({
+      preset: 'EDGE_START',
+      origin: plane.origin,
+      xDir: plane.xDir,
+      normal: plane.normal,
+      outwardNormal: plane.outwardNormal,
+    });
+    // Slice the live model with the sketch plane so the user sees a
+    // silhouette of the solid at the edge they're sweeping along — same
+    // visual mechanism as `referenceOutline` for face-anchored sketches,
+    // just sourced from a triangle-vs-plane intersection instead of the
+    // worker's per-face boundary extractor.
+    setSketchReference(
+      sliceModelByPlane(plane.origin, plane.normal, plane.xDir)
+    );
+    setSelectedEdgeIds([]);
+    setSelectedSketchId(null);
+    setSelectedFace(null);
+    setMode('sketching');
+  };
+
   const sketchOnSelectedFace = () => {
     if (!selectedFace || !selectedFace.isPlanar) return;
     setPickedPlane({
@@ -842,22 +1364,6 @@ function App() {
     setMode('sketching');
   };
 
-  const addOperation = (type: OperationType) => {
-    if (type === 'sketch_extrude') {
-      startNewSketch();
-      return;
-    }
-
-    const newOp: Operation = {
-      id: Math.random().toString(36).substr(2, 9),
-      type,
-      params: { width: 10, height: 10, depth: 10 }
-    };
-    const newHistory = [...history, newOp];
-    setHistory(newHistory);
-    handleBuild(newHistory);
-  };
-
   const handleSaveSketch = (shapes: any[], constraints: any[] = []) => {
     const plane = pickedPlane
       ? {
@@ -868,6 +1374,7 @@ function App() {
           preset: pickedPlane.preset,
         }
       : undefined;
+    const pendingSweep = sweepPendingRef.current;
     let newHistory: Operation[];
     let resultId: string;
     if (editingOpId) {
@@ -878,6 +1385,31 @@ function App() {
           : op
       );
       resultId = editingOpId;
+    } else if (pendingSweep) {
+      // Fresh sweep op — anchored to the picked edge by midpoint, with the
+      // captured upHint so the worker reproduces the same plane on every
+      // build even when downstream geometry changes.
+      const newOp: Operation = {
+        id: Math.random().toString(36).substr(2, 9),
+        type: 'sweep',
+        params: {
+          shapes,
+          constraints,
+          edgeAnchor: {
+            midpoint: pendingSweep.midpoint,
+            tangentHint: pendingSweep.tangentHint,
+          },
+          upHint: pendingSweep.upHint,
+          startParam: 0,
+          endParam: 1,
+          mode: 'add',
+          visible: true,
+          plane,
+          referenceOutline: sketchReference ?? undefined,
+        },
+      };
+      newHistory = [...history, newOp];
+      resultId = newOp.id;
     } else {
       const newOp: Operation = {
         id: Math.random().toString(36).substr(2, 9),
@@ -903,13 +1435,23 @@ function App() {
     setEditingOpId(null);
     setEditingShapes(null);
     setEditingConstraints(null);
+    const isSweepSave = !!pendingSweep;
+    sweepPendingRef.current = null;
     setSelectedSketchId(resultId);
-    // Re-frame the 3D viewport so the just-saved sketch is centered + visible
-    // with margin, ready for the user's next action (extrude, pocket, etc.).
-    const bounds = computeSketchBounds(shapes, plane);
-    if (bounds) {
-      setCameraFitTarget(bounds);
-      setCameraFitSignal((s) => s + 1);
+    // Re-frame the 3D viewport so the just-saved sketch is centered +
+    // visible with margin — sized around the profile shapes for normal
+    // sketch_extrude saves. Skip the auto-fit for sweep saves: the
+    // profile is a small cross-section but the swept solid extends far
+    // along the edge, so framing on the profile lands the camera
+    // INSIDE the resulting solid (the user reported "blue veil"
+    // covering the view). The user can use the view-snap buttons to
+    // re-frame on the full model when needed.
+    if (!isSweepSave) {
+      const bounds = computeSketchBounds(shapes, plane);
+      if (bounds) {
+        setCameraFitTarget(bounds);
+        setCameraFitSignal((s) => s + 1);
+      }
     }
     handleBuild(newHistory);
   };
@@ -971,6 +1513,15 @@ function App() {
     handleBuild(newHistory);
   };
 
+  /** Flip a sweep op between additive and subtractive (cut) modes. */
+  const setSweepMode = (opId: string, mode: 'add' | 'subtract') => {
+    const newHistory = history.map((op) =>
+      op.id === opId ? { ...op, params: { ...op.params, mode } } : op
+    );
+    setHistory(newHistory);
+    handleBuild(newHistory);
+  };
+
   const removeOperation = (id: string) => {
     // Single-op delete. Downstream ops are NOT removed — the worker is
     // tolerant (face anchors re-resolve against the new model, fillet /
@@ -997,6 +1548,11 @@ function App() {
           referenceOutline={sketchReference ?? undefined}
           initialShapes={editingShapes ?? undefined}
           initialConstraints={editingConstraints ?? undefined}
+          originMarker={
+            pickedPlane?.preset === 'EDGE_START'
+              ? { label: 'edge', color: '#22c55e' }
+              : undefined
+          }
           onSave={handleSaveSketch}
           onCancel={cancelSketchFlow}
         />
@@ -1088,7 +1644,9 @@ function App() {
                         ? `Fillet R${op.params.radius}mm · ${op.params.edgePoints?.length ?? 0} edges`
                         : op.type === 'chamfer'
                           ? `Chamfer ${op.params.distance}mm · ${op.params.edgePoints?.length ?? 0} edges`
-                          : 'Box'}
+                          : op.type === 'sweep'
+                            ? `Sweep ${op.params.mode === 'subtract' ? '(cut)' : '(add)'} · ${op.params.shapes?.length ?? 0} shape${(op.params.shapes?.length ?? 0) === 1 ? '' : 's'}`
+                            : 'Box'}
                   </span>
                   <div className="flex items-center gap-1">
                     {op.type === 'sketch_extrude' && (
@@ -1104,7 +1662,7 @@ function App() {
                         {op.params.visible === true ? <Eye size={14} /> : <EyeOff size={14} />}
                       </button>
                     )}
-                    {op.type === 'sketch_extrude' && (
+                    {(op.type === 'sketch_extrude' || op.type === 'sweep') && (
                       <button
                         onClick={() => editSketchOp(op)}
                         className="p-1 text-slate-500 hover:text-blue-300 hover:bg-blue-400/10 rounded opacity-0 group-hover:opacity-100 transition-all"
@@ -1126,6 +1684,10 @@ function App() {
                   {Object.entries(op.params).map(([key, val]) => {
                     if (key === 'shapes' || key === 'plane') return null;
                     if (typeof val !== 'number') return null;
+                    // Sweep params handled by the dedicated panel below;
+                    // keep the auto-slider loop out of them so we don't
+                    // surface raw startParam / endParam sliders.
+                    if (op.type === 'sweep') return null;
                     const isSketchDepth = op.type === 'sketch_extrude' && key === 'depth';
                     if (isSketchDepth && Math.abs(val) <= 1e-6) {
                       // depth = 0 means the op is still a sketch; offer Extrude / Pocket buttons.
@@ -1206,6 +1768,42 @@ function App() {
                         <div className="font-mono text-slate-400">
                           plane {op.params.plane.preset ?? '?'} · origin (
                           {op.params.plane.origin.map(fmt).join(', ')})
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {op.type === 'sweep' && (
+                    <div className="pt-2 border-t border-slate-700/50 text-[10px] text-slate-500 space-y-2">
+                      <div className="flex bg-slate-700/50 rounded-md p-0.5 gap-0.5">
+                        <button
+                          onClick={() => setSweepMode(op.id, 'add')}
+                          className={`flex-1 px-2 py-1 rounded text-[10px] font-semibold transition-colors ${
+                            op.params.mode !== 'subtract'
+                              ? 'bg-blue-600 text-white shadow'
+                              : 'text-slate-300 hover:bg-slate-600'
+                          }`}
+                        >
+                          Solid
+                        </button>
+                        <button
+                          onClick={() => setSweepMode(op.id, 'subtract')}
+                          className={`flex-1 px-2 py-1 rounded text-[10px] font-semibold transition-colors ${
+                            op.params.mode === 'subtract'
+                              ? 'bg-amber-600 text-white shadow'
+                              : 'text-slate-300 hover:bg-slate-600'
+                          }`}
+                        >
+                          Cut
+                        </button>
+                      </div>
+                      <div className="flex items-center gap-2 italic">
+                        <div className="w-1 h-1 bg-emerald-500 rounded-full"></div>
+                        {op.params.shapes.length} shape
+                        {op.params.shapes.length === 1 ? '' : 's'} along edge
+                      </div>
+                      {op.params.edgeAnchor?.midpoint && (
+                        <div className="font-mono text-slate-400">
+                          edge midpoint ({op.params.edgeAnchor.midpoint.map(fmt).join(', ')})
                         </div>
                       )}
                     </div>
@@ -1291,7 +1889,7 @@ function App() {
       {/* Main Viewport */}
       <div className="flex-1 relative bg-[#0f172a]">
         <Canvas
-          camera={{ position: [30, -30, 30], up: [0, 0, 1], fov: 45 }}
+          camera={{ position: [30, -30, 30], up: [0, 0, 1], fov: 45, near: 0.5, far: 100000 }}
           raycaster={{ params: { Line: { threshold: 1.5 }, Mesh: {}, Points: { threshold: 1 }, LOD: {}, Sprite: {} } as any }}
           onPointerMissed={() => {
             setSelectedSketchId(null);
@@ -1300,9 +1898,15 @@ function App() {
           }}
         >
           <color attach="background" args={['#0f172a']} />
-          <ambientLight intensity={0.6} />
-          <pointLight position={[20, 20, 20]} intensity={1} />
-          <pointLight position={[-20, -20, -20]} intensity={0.5} />
+          {/* Directional + ambient + hemisphere instead of point lights:
+              point lights decay with distance, so a tall extrusion's far
+              side fell into shadow and read as "fading into fog". With
+              directional lights the model is uniformly lit regardless of
+              its size or distance from the camera. */}
+          <ambientLight intensity={0.55} />
+          <hemisphereLight args={['#cbd5e1', '#1e293b', 0.35]} />
+          <directionalLight position={[10, 10, 20]} intensity={0.8} />
+          <directionalLight position={[-10, -10, -5]} intensity={0.35} />
           <CameraFit signal={cameraFitSignal} target={cameraFitTarget} />
           {/* World axes: small triad at the origin (red=X, green=Y, blue=Z) so
               the user can correlate sketcher reference axes with the 3D view. */}
@@ -1367,23 +1971,29 @@ function App() {
           )}
         </Canvas>
 
-        {/* Toolbar Overlay */}
-        <div className="absolute top-6 left-6 flex gap-3">
-          <div className="bg-slate-800/90 backdrop-blur-md border border-slate-700/50 rounded-lg p-1.5 flex gap-1 shadow-2xl">
-            <button
-              onClick={() => addOperation('box')}
-              className="px-4 py-2 hover:bg-blue-600 hover:text-white rounded-md text-xs font-bold transition-all flex items-center gap-2 text-slate-300"
-            >
-              <Box size={14} /> Add Box
-            </button>
-            <div className="w-px bg-slate-700 mx-1 my-1"></div>
-            <button
-              onClick={startNewSketch}
-              className="px-4 py-2 hover:bg-blue-600 hover:text-white rounded-md text-xs font-bold transition-all flex items-center gap-2 text-slate-300"
-            >
-              <Pencil size={14} /> New Sketch
-            </button>
-          </div>
+        {/* Quick view selector — laid out as the unfolded faces of a
+            cube so the spatial relationship is immediately readable
+            (Top stacks over Front, Left/Right flank it, Bot sits
+            below, Back goes to the far right next to Right). Each
+            button has its own glassmorphism panel — there's no
+            wrapping container, so the underlying canvas reads
+            through the gaps. */}
+        <div
+          className="absolute top-6 left-6 grid gap-1.5"
+          style={{ gridTemplateColumns: 'repeat(4, 56px)' }}
+        >
+          <div />
+          <ViewBtn view="top" label="Top" onClick={() => snapToView('top')} />
+          <div />
+          <div />
+          <ViewBtn view="left" label="Left" onClick={() => snapToView('left')} />
+          <ViewBtn view="front" label="Front" onClick={() => snapToView('front')} />
+          <ViewBtn view="right" label="Right" onClick={() => snapToView('right')} />
+          <ViewBtn view="back" label="Back" onClick={() => snapToView('back')} />
+          <div />
+          <ViewBtn view="bottom" label="Bot" onClick={() => snapToView('bottom')} />
+          <div />
+          <div />
         </div>
 
         {/* Selected edges HUD */}
@@ -1394,6 +2004,7 @@ function App() {
             onValueChange={setFilletValue}
             onFillet={() => applyEdgeOp('fillet')}
             onChamfer={() => applyEdgeOp('chamfer')}
+            onSweep={sweepAlongSelectedEdge}
             onCancel={() => setSelectedEdgeIds([])}
             shortestEdgeLength={shortestSelectedEdgeLength}
           />
@@ -1555,6 +2166,7 @@ function EdgeHUD({
   onValueChange,
   onFillet,
   onChamfer,
+  onSweep,
   onCancel,
   shortestEdgeLength,
 }: {
@@ -1563,6 +2175,8 @@ function EdgeHUD({
   onValueChange: (v: number) => void;
   onFillet: () => void;
   onChamfer: () => void;
+  /** Open the sketcher to sweep a profile along the (single) selected edge. */
+  onSweep?: () => void;
   onCancel: () => void;
   /** Length of the shortest currently-selected edge in mm. The HUD uses
    *  this to suggest a maximum safe radius; the fillet algorithm tends
@@ -1637,6 +2251,20 @@ function EdgeHUD({
             Chamfer
           </button>
         </div>
+        {onSweep && (
+          <button
+            onClick={onSweep}
+            disabled={count !== 1}
+            title={
+              count === 1
+                ? 'Open the sketcher to draw a profile that sweeps along this edge.'
+                : 'Sweep takes exactly one edge — pick a single edge.'
+            }
+            className="w-full px-3 py-2 text-xs font-bold rounded-md bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 disabled:text-slate-500 text-white"
+          >
+            Sweep along edge
+          </button>
+        )}
         <div className="text-[10px] text-slate-500 leading-relaxed">
           Click an edge to select. Shift / Ctrl-click to add or remove.
         </div>

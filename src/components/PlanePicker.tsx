@@ -6,7 +6,7 @@ import * as THREE from 'three';
 export type PlaneName = 'XY' | 'XZ' | 'YZ';
 
 export interface PickedPlane {
-  preset: PlaneName | 'FACE';
+  preset: PlaneName | 'FACE' | 'EDGE_START';
   origin: [number, number, number];
   xDir: [number, number, number];
   /** Plane normal as sent to the kernel. For face-derived planes this can

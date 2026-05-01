@@ -73,8 +73,11 @@ interface ConstraintBase {
 }
 
 export type Constraint =
-  // Geometric (single-entity)
+  // Geometric (single-entity) — `horizontal` / `vertical` orient a line or
+  // rect edge OR align two points. Both forms share the same `type`; the
+  // solver / UI inspect which shape is present to choose its behavior.
   | (ConstraintBase & { id: string; type: 'horizontal' | 'vertical'; ref: EntityRef })
+  | (ConstraintBase & { id: string; type: 'horizontal' | 'vertical'; a: EntityRef; b: EntityRef })
   | (ConstraintBase & { id: string; type: 'fix'; ref: EntityRef; value: { x: number; y: number } })
   // Geometric (pair)
   | (ConstraintBase & {
@@ -265,11 +268,25 @@ const getPoint = (ref: EntityRef, x: Float64Array, layout: Layout): Pt2 | null =
     const ry = x[o + 1];
     const w = x[o + 2];
     const h = x[o + 3];
-    if (ref.role === 'tl') return { x: rx, y: ry + h };
-    if (ref.role === 'tr') return { x: rx + w, y: ry + h };
-    if (ref.role === 'br') return { x: rx + w, y: ry };
-    if (ref.role === 'bl') return { x: rx, y: ry };
-    if (ref.role === 'center') return { x: rx + w / 2, y: ry + h / 2 };
+    // Rotation isn't in the parameter vector (the solver doesn't move
+    // it), so read it from the shape definition. Pivot is the rect's
+    // center.
+    const angle = (s as { angle?: number }).angle ?? 0;
+    const cx = rx + w / 2;
+    const cy = ry + h / 2;
+    const rot = (px: number, py: number) => {
+      if (Math.abs(angle) < 1e-12) return { x: px, y: py };
+      const c = Math.cos(angle);
+      const sa = Math.sin(angle);
+      const dx = px - cx;
+      const dy = py - cy;
+      return { x: cx + dx * c - dy * sa, y: cy + dx * sa + dy * c };
+    };
+    if (ref.role === 'tl') return rot(rx, ry + h);
+    if (ref.role === 'tr') return rot(rx + w, ry + h);
+    if (ref.role === 'br') return rot(rx + w, ry);
+    if (ref.role === 'bl') return rot(rx, ry);
+    if (ref.role === 'center') return { x: cx, y: cy };
   } else if (s.type === 'polyline' && ref.role === 'vertex' && ref.vertexIdx != null) {
     return { x: x[o + ref.vertexIdx * 2], y: x[o + ref.vertexIdx * 2 + 1] };
   }
@@ -296,10 +313,21 @@ const getLineEnds = (
     const ry = x[o + 1];
     const w = x[o + 2];
     const h = x[o + 3];
-    if (ref.edge === 'top') return { p1: { x: rx, y: ry + h }, p2: { x: rx + w, y: ry + h } };
-    if (ref.edge === 'bottom') return { p1: { x: rx, y: ry }, p2: { x: rx + w, y: ry } };
-    if (ref.edge === 'left') return { p1: { x: rx, y: ry }, p2: { x: rx, y: ry + h } };
-    if (ref.edge === 'right') return { p1: { x: rx + w, y: ry }, p2: { x: rx + w, y: ry + h } };
+    const angle = (s as { angle?: number }).angle ?? 0;
+    const cx = rx + w / 2;
+    const cy = ry + h / 2;
+    const rot = (px: number, py: number): Pt2 => {
+      if (Math.abs(angle) < 1e-12) return { x: px, y: py };
+      const c = Math.cos(angle);
+      const sa = Math.sin(angle);
+      const dx = px - cx;
+      const dy = py - cy;
+      return { x: cx + dx * c - dy * sa, y: cy + dx * sa + dy * c };
+    };
+    if (ref.edge === 'top') return { p1: rot(rx, ry + h), p2: rot(rx + w, ry + h) };
+    if (ref.edge === 'bottom') return { p1: rot(rx, ry), p2: rot(rx + w, ry) };
+    if (ref.edge === 'left') return { p1: rot(rx, ry), p2: rot(rx, ry + h) };
+    if (ref.edge === 'right') return { p1: rot(rx + w, ry), p2: rot(rx + w, ry + h) };
   }
   return null;
 };
@@ -348,11 +376,23 @@ const getCircle = (
 const residualOf = (c: Constraint, x: Float64Array, layout: Layout): number[] => {
   switch (c.type) {
     case 'horizontal': {
-      const e = getLineEnds(c.ref, x, layout);
+      // Two-point form: the two points share a y-coord.
+      if ('a' in c && 'b' in c) {
+        const pa = getPoint(c.a, x, layout);
+        const pb = getPoint(c.b, x, layout);
+        return pa && pb ? [pa.y - pb.y] : [];
+      }
+      // Line/edge form: the segment's two endpoints share a y-coord.
+      const e = 'ref' in c ? getLineEnds(c.ref, x, layout) : null;
       return e ? [e.p2.y - e.p1.y] : [];
     }
     case 'vertical': {
-      const e = getLineEnds(c.ref, x, layout);
+      if ('a' in c && 'b' in c) {
+        const pa = getPoint(c.a, x, layout);
+        const pb = getPoint(c.b, x, layout);
+        return pa && pb ? [pa.x - pb.x] : [];
+      }
+      const e = 'ref' in c ? getLineEnds(c.ref, x, layout) : null;
       return e ? [e.p2.x - e.p1.x] : [];
     }
     case 'fix': {
@@ -430,6 +470,30 @@ const residualOf = (c: Constraint, x: Float64Array, layout: Layout): number[] =>
       if (!line || !cir) return [];
       const d = Math.abs(signedPerpDist(cir.center, line));
       return [d - cir.radius];
+    }
+    case 'angle': {
+      // Signed angle between line `a`'s direction and line `b`'s
+      // direction, wrapped to (-π, π], with `c.value` as the target
+      // (also in radians, signed). Lines don't need to share an
+      // endpoint or be near each other — the constraint operates on
+      // their direction vectors only.
+      const eA = getLineEnds(c.a, x, layout);
+      const eB = getLineEnds(c.b, x, layout);
+      if (!eA || !eB) return [];
+      const ax = eA.p2.x - eA.p1.x;
+      const ay = eA.p2.y - eA.p1.y;
+      const bx = eB.p2.x - eB.p1.x;
+      const by = eB.p2.y - eB.p1.y;
+      const lenA = Math.hypot(ax, ay);
+      const lenB = Math.hypot(bx, by);
+      if (lenA < 1e-9 || lenB < 1e-9) return [];
+      let diff = Math.atan2(ay, ax) - Math.atan2(by, bx);
+      while (diff > Math.PI) diff -= 2 * Math.PI;
+      while (diff <= -Math.PI) diff += 2 * Math.PI;
+      let resid = diff - c.value;
+      while (resid > Math.PI) resid -= 2 * Math.PI;
+      while (resid <= -Math.PI) resid += 2 * Math.PI;
+      return [resid];
     }
     case 'coord-x': {
       const p = getPoint(c.ref, x, layout);
@@ -682,7 +746,13 @@ export const canCreate = (type: ConstraintType, refs: EntityRef[]): boolean => {
   if (refs.length !== arity(type)) return false;
   switch (type) {
     case 'horizontal':
-    case 'vertical':
+    case 'vertical': {
+      // Single line/edge → orient that segment.
+      if (refs.length === 1) return isLineish(refs[0]);
+      // Two points → align them. Order matters (first moves to second).
+      if (refs.length === 2) return isPoint(refs[0]) && isPoint(refs[1]);
+      return false;
+    }
     case 'length':
       return isLineish(refs[0]);
     case 'fix':
@@ -713,6 +783,13 @@ export const canCreate = (type: ConstraintType, refs: EntityRef[]): boolean => {
       const aC = a.kind === 'circle';
       const bC = b.kind === 'circle';
       return (aL && bC) || (aC && bL);
+    }
+    case 'angle': {
+      // Two lines (or rect / rounded-rect edges, or the local axes —
+      // all of which are line-ish refs).
+      const a = refs[0];
+      const b = refs[1];
+      return isLineish(a) && isLineish(b);
     }
     default:
       return false;

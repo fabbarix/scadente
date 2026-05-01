@@ -22,6 +22,7 @@ import {
   Ruler,
   MoveHorizontal,
   MoveVertical,
+  Triangle,
 } from 'lucide-react';
 import { solve, canCreate, arity, constraintResiduals, RESIDUAL_TOL } from './sketcher/constraints';
 import type { Constraint, ConstraintType, EntityRef } from './sketcher/constraints';
@@ -30,7 +31,20 @@ type Pt = { x: number; y: number };
 type Tool = 'select' | 'rect' | 'rounded-rect' | 'circle' | 'arc' | 'line' | 'polyline';
 
 type BoolOp = 'add' | 'subtract';
-interface RectShape { id: string; type: 'rect'; x: number; y: number; width: number; height: number; operation: BoolOp; }
+interface RectShape {
+  id: string;
+  type: 'rect';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** Rotation in radians, around the rect's center. Defaults to 0
+   *  (axis-aligned) when undefined. The (x, y) anchor stays at the
+   *  pre-rotation bottom-left corner; rotation is purely visual /
+   *  exporting. */
+  angle?: number;
+  operation: BoolOp;
+}
 interface RoundedRectShape {
   id: string;
   type: 'rounded-rect';
@@ -39,6 +53,8 @@ interface RoundedRectShape {
   width: number;
   height: number;
   cornerRadius: number;
+  /** Rotation in radians, around the rect's center. See RectShape.angle. */
+  angle?: number;
   operation: BoolOp;
 }
 interface CircleShape { id: string; type: 'circle'; cx: number; cy: number; radius: number; operation: BoolOp; }
@@ -95,6 +111,7 @@ export function opShapesToSketcher(savedShapes: any[]): SketcherShape[] {
         y: s.y - s.height / 2,
         width: s.width,
         height: s.height,
+        angle: typeof s.angle === 'number' ? s.angle : 0,
         operation: op,
       });
     } else if (s.type === 'rounded-rect') {
@@ -106,6 +123,7 @@ export function opShapesToSketcher(savedShapes: any[]): SketcherShape[] {
         width: s.width,
         height: s.height,
         cornerRadius: typeof s.cornerRadius === 'number' ? s.cornerRadius : 0,
+        angle: typeof s.angle === 'number' ? s.angle : 0,
         operation: op,
       });
     } else if (s.type === 'circle') {
@@ -161,7 +179,7 @@ interface SketcherProps {
   initialShapes?: Shape[];
   initialConstraints?: Constraint[];
   plane?: {
-    preset: 'XY' | 'XZ' | 'YZ' | 'FACE';
+    preset: 'XY' | 'XZ' | 'YZ' | 'FACE' | 'EDGE_START';
     origin: [number, number, number];
     /** Plane-local +x direction in world coords. Used to draw world axis
      *  indicators in the sketcher. Optional for back-compat. */
@@ -172,6 +190,11 @@ interface SketcherProps {
   };
   /** Plane-local 2D segments (flat array x1,y1,x2,y2,...) drawn behind the canvas as a non-editable guide. */
   referenceOutline?: number[];
+  /** When set, the Sketcher draws a prominent marker at the origin
+   *  labelled with this string. Used by the sweep flow to point out
+   *  where the picked edge intersects the perpendicular sketch plane —
+   *  the profile gets swept in / around that point. */
+  originMarker?: { label: string; color?: string };
 }
 
 const PX_PER_MM = 5;
@@ -250,6 +273,40 @@ const offsetPolygon = (pts: Pt[], outward: number): Pt[] | null => {
   if (Math.sign(newArea2) !== Math.sign(area2)) return null;
   return out;
 };
+
+/**
+ * Rotate a 2D point around a pivot by `angle` radians (CCW).
+ */
+const rotatePoint = (
+  p: { x: number; y: number },
+  pivot: { x: number; y: number },
+  angle: number
+): { x: number; y: number } => {
+  if (Math.abs(angle) < 1e-12) return p;
+  const c = Math.cos(angle);
+  const s = Math.sin(angle);
+  const dx = p.x - pivot.x;
+  const dy = p.y - pivot.y;
+  return {
+    x: pivot.x + dx * c - dy * s,
+    y: pivot.y + dx * s + dy * c,
+  };
+};
+
+/**
+ * Center of a rect / rounded-rect's pre-rotation bbox — the pivot used by
+ * its `angle` field. Convenient for snap / pointAt / lineEndsOf which all
+ * rotate corner positions around this same point.
+ */
+const rectCenter = (s: {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}): { x: number; y: number } => ({
+  x: s.x + s.width / 2,
+  y: s.y + s.height / 2,
+});
 
 /**
  * Circumscribe a circle through three points and return the arc that goes
@@ -562,6 +619,27 @@ const detectClosedCompounds = (
 };
 
 /**
+ * Rounded-rect glyph drawn as an inline SVG. Lucide's `Square` is shared
+ * with the plain rect tool; this variant uses an `rx` corner so the
+ * rounded-rect tool reads distinct in the toolbar.
+ */
+const RoundedRectIcon = ({ size = 14 }: { size?: number }) => (
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={2}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <rect x={3} y={3} width={18} height={18} rx={6} ry={6} />
+  </svg>
+);
+
+/**
  * Quarter-arc glyph drawn as an inline SVG. Lucide doesn't ship a "circular
  * arc" icon, and reusing `Circle` made the Arc tool indistinguishable from
  * Circle in the toolbar. Stroke / size match Lucide's defaults so it sits
@@ -594,6 +672,7 @@ export function Sketcher({
   initialConstraints = [],
   plane,
   referenceOutline,
+  originMarker,
 }: SketcherProps) {
   // Initial frozen lines built from the face boundary (when sketching on a
   // face). They're plain LineShapes flagged `frozen` — pickable for snap
@@ -948,18 +1027,23 @@ export function Sketcher({
       if (s.id === skipId) continue;
       if (s.type === 'rect' || s.type === 'rounded-rect') {
         const x0 = s.x, y0 = s.y, x1 = s.x + s.width, y1 = s.y + s.height;
+        const c = rectCenter(s);
+        const a = s.angle ?? 0;
+        const rot = (p: Pt) => rotatePoint(p, c, a);
         // Corner roles match the convention used elsewhere: bl is the
-        // (x,y) anchor; tl is at (x, y+h); etc.
-        out.push({ pt: { x: x0, y: y0 }, kind: 'rect-corner', ref: cornerRef(s.id, 'bl') });
-        out.push({ pt: { x: x1, y: y0 }, kind: 'rect-corner', ref: cornerRef(s.id, 'br') });
-        out.push({ pt: { x: x1, y: y1 }, kind: 'rect-corner', ref: cornerRef(s.id, 'tr') });
-        out.push({ pt: { x: x0, y: y1 }, kind: 'rect-corner', ref: cornerRef(s.id, 'tl') });
-        out.push({ pt: { x: (x0 + x1) / 2, y: y0 }, kind: 'rect-edge-mid' });
-        out.push({ pt: { x: x1, y: (y0 + y1) / 2 }, kind: 'rect-edge-mid' });
-        out.push({ pt: { x: (x0 + x1) / 2, y: y1 }, kind: 'rect-edge-mid' });
-        out.push({ pt: { x: x0, y: (y0 + y1) / 2 }, kind: 'rect-edge-mid' });
+        // (x,y) anchor; tl is at (x, y+h); etc. Rotation is applied
+        // around the rect's center so all snap points follow the
+        // visible orientation.
+        out.push({ pt: rot({ x: x0, y: y0 }), kind: 'rect-corner', ref: cornerRef(s.id, 'bl') });
+        out.push({ pt: rot({ x: x1, y: y0 }), kind: 'rect-corner', ref: cornerRef(s.id, 'br') });
+        out.push({ pt: rot({ x: x1, y: y1 }), kind: 'rect-corner', ref: cornerRef(s.id, 'tr') });
+        out.push({ pt: rot({ x: x0, y: y1 }), kind: 'rect-corner', ref: cornerRef(s.id, 'tl') });
+        out.push({ pt: rot({ x: (x0 + x1) / 2, y: y0 }), kind: 'rect-edge-mid' });
+        out.push({ pt: rot({ x: x1, y: (y0 + y1) / 2 }), kind: 'rect-edge-mid' });
+        out.push({ pt: rot({ x: (x0 + x1) / 2, y: y1 }), kind: 'rect-edge-mid' });
+        out.push({ pt: rot({ x: x0, y: (y0 + y1) / 2 }), kind: 'rect-edge-mid' });
         out.push({
-          pt: { x: (x0 + x1) / 2, y: (y0 + y1) / 2 },
+          pt: c,
           kind: 'rect-center',
           ref: cornerRef(s.id, 'center'),
         });
@@ -1107,12 +1191,58 @@ export function Sketcher({
     [shapes, selectedId]
   );
 
+  /**
+   * Snap the polyline's next vertex so the new segment lands at a 5°
+   * multiple relative to the previous segment's direction. The cursor
+   * length (from the last placed vertex) is preserved — only the
+   * direction is rounded. Returns the cursor unchanged when there isn't
+   * a previous segment, when shift overrides snapping, or when a feature
+   * snap already claimed the point.
+   */
+  const POLY_ANGLE_SNAP_RAD = (5 * Math.PI) / 180;
+  const applyPolyAngleSnap = (
+    points: Pt[],
+    cursor: Pt
+  ): { pt: Pt; angleDeg: number | null } => {
+    if (points.length < 2) return { pt: cursor, angleDeg: null };
+    const prev = points[points.length - 1];
+    const prev2 = points[points.length - 2];
+    const prevDx = prev.x - prev2.x;
+    const prevDy = prev.y - prev2.y;
+    if (Math.hypot(prevDx, prevDy) < 1e-6) {
+      return { pt: cursor, angleDeg: null };
+    }
+    const prevAngle = Math.atan2(prevDy, prevDx);
+    const dx = cursor.x - prev.x;
+    const dy = cursor.y - prev.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-6) return { pt: cursor, angleDeg: 0 };
+    const cursorAngle = Math.atan2(dy, dx);
+    let rel = cursorAngle - prevAngle;
+    while (rel > Math.PI) rel -= 2 * Math.PI;
+    while (rel <= -Math.PI) rel += 2 * Math.PI;
+    const snappedRel = Math.round(rel / POLY_ANGLE_SNAP_RAD) * POLY_ANGLE_SNAP_RAD;
+    const snappedAngle = prevAngle + snappedRel;
+    return {
+      pt: {
+        x: prev.x + len * Math.cos(snappedAngle),
+        y: prev.y + len * Math.sin(snappedAngle),
+      },
+      angleDeg: (snappedRel * 180) / Math.PI,
+    };
+  };
+
   const switchTool = (next: Tool) => {
     setTool(next);
     setDraft(null);
     setPolyDraft(null);
     setArcDraft(null);
     setArcCursor(null);
+    // Picking a drawing / selection tool also exits any sticky
+    // constraint pick mode — same effect as Esc.
+    setPendingConstraint(null);
+    setPendingRefs([]);
+    setPendingHover(null);
   };
 
   const updateShape = (id: string, patch: Partial<Shape> | any) => {
@@ -1123,6 +1253,47 @@ export function Sketcher({
   // its size or orientation. Used by the coincident-constraint flow to move
   // the first-clicked point's shape so the picked point lands on the
   // second-clicked one.
+  /**
+   * Rotate a shape in place by `deltaRad` radians around its own
+   * centroid. Used by the property-panel rotate control for shapes
+   * whose rotation isn't captured by an explicit `angle` field
+   * (lines / polylines / arcs).
+   *
+   * - line: rotate p1, p2 around the segment midpoint.
+   * - polyline: rotate every vertex around the average vertex.
+   * - arc: bump startAngle / endAngle by the delta — the arc's center
+   *   stays put, which matches "rotate about the arc's pivot".
+   * - rect / rounded-rect: bump the explicit `angle` field.
+   * - circle: no-op (rotation has no visible effect).
+   */
+  const rotateShapeBy = (s: Shape, deltaRad: number): Shape => {
+    if (Math.abs(deltaRad) < 1e-9) return s;
+    if (s.type === 'rect' || s.type === 'rounded-rect') {
+      return { ...s, angle: (s.angle ?? 0) + deltaRad } as Shape;
+    }
+    if (s.type === 'line') {
+      const mid = { x: (s.x1 + s.x2) / 2, y: (s.y1 + s.y2) / 2 };
+      const p1 = rotatePoint({ x: s.x1, y: s.y1 }, mid, deltaRad);
+      const p2 = rotatePoint({ x: s.x2, y: s.y2 }, mid, deltaRad);
+      return { ...s, x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y };
+    }
+    if (s.type === 'polyline') {
+      const cx = s.points.reduce((a, p) => a + p.x, 0) / s.points.length;
+      const cy = s.points.reduce((a, p) => a + p.y, 0) / s.points.length;
+      const pivot = { x: cx, y: cy };
+      const next = s.points.map((p) => rotatePoint(p, pivot, deltaRad));
+      return { ...s, points: next };
+    }
+    if (s.type === 'arc') {
+      return {
+        ...s,
+        startAngle: s.startAngle + deltaRad,
+        endAngle: s.endAngle + deltaRad,
+      };
+    }
+    return s;
+  };
+
   const translateShape = (s: Shape, dx: number, dy: number): Shape => {
     if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) return s;
     if (s.type === 'rect') return { ...s, x: s.x + dx, y: s.y + dy };
@@ -1460,7 +1631,42 @@ export function Sketcher({
     let next: Constraint | null = null;
     const id = newConstraintId();
     if (type === 'horizontal' || type === 'vertical') {
-      next = { id, type, ref: refs[0] };
+      // Two-point form: align first picked to second's x (vertical) or
+      // y (horizontal). Pre-translate the first point's shape so its
+      // picked coord matches the second's, exactly like the coincident
+      // pre-shift, so the user sees an immediate snap on creation.
+      if (
+        refs.length === 2 &&
+        refs[0].kind === 'point' &&
+        refs[1].kind === 'point'
+      ) {
+        const a = refs[0];
+        const b = refs[1];
+        const sa = shapes.find((s) => s.id === a.shapeId);
+        const sb = shapes.find((s) => s.id === b.shapeId);
+        const pa = sa ? pointAt(sa, a) : null;
+        const pb = sb ? pointAt(sb, b) : null;
+        next = { id, type, a, b };
+        if (pa && pb && sa && !(sa.type === 'line' && sa.frozen)) {
+          const dx = type === 'vertical' ? pb.x - pa.x : 0;
+          const dy = type === 'horizontal' ? pb.y - pa.y : 0;
+          applyShapes(
+            (prev) =>
+              prev.map((s) =>
+                s.id === a.shapeId ? translateShape(s, dx, dy) : s
+              ),
+            [next]
+          );
+          setConstraints((p) => [...p, next!]);
+          // Sticky tool: keep `pendingConstraint` set so the user can
+          // chain more H/V constraints. ESC or another tool clears it.
+          setPendingRefs([]);
+          setPendingHover(null);
+          return;
+        }
+      } else {
+        next = { id, type, ref: refs[0] };
+      }
     } else if (type === 'fix') {
       const p = refs[0];
       // Capture current world position as the fix value.
@@ -1490,7 +1696,8 @@ export function Sketcher({
           [next]
         );
         setConstraints((p) => [...p, next!]);
-        setPendingConstraint(null);
+        // Sticky tool: keep pendingConstraint set; ESC or different
+        // toolbar pick exits.
         setPendingRefs([]);
         setPendingHover(null);
         return;
@@ -1532,13 +1739,33 @@ export function Sketcher({
             setConstraints(all);
             constraintsRef.current = all;
             applyShapes((p) => p);
-            setPendingConstraint(null);
+            // Sticky tool — see other branches for the rationale.
             setPendingRefs([]);
             setPendingHover(null);
             return;
           }
         }
       }
+    } else if (type === 'angle') {
+      // Two lines (or rect edges, or axes — all are line-ish refs).
+      // Capture the current angle between them as the initial value,
+      // signed in radians, A relative to B. Editing the value via the
+      // constraints panel pre-rotates line A around its midpoint by the
+      // delta so the first-clicked entity is the one that visibly
+      // moves to satisfy the new target.
+      const a = refs[0];
+      const b = refs[1];
+      const dirA = lineDirection(a);
+      const dirB = lineDirection(b);
+      if (!dirA || !dirB) {
+        flashHint('Angle: both picks must be lines or rect edges.');
+        setPendingRefs([]);
+        return;
+      }
+      let diff = Math.atan2(dirA.y, dirA.x) - Math.atan2(dirB.y, dirB.x);
+      while (diff > Math.PI) diff -= 2 * Math.PI;
+      while (diff <= -Math.PI) diff += 2 * Math.PI;
+      next = { id, type: 'angle', a, b, value: diff };
     } else if (type === 'distance') {
       let a = refs[0];
       let b = refs[1];
@@ -1550,7 +1777,7 @@ export function Sketcher({
       if (aL && bL) {
         if (!areParallel(a, b)) {
           flashHint('Lines must be parallel — add a parallel constraint first.');
-          setPendingConstraint(null);
+          // Keep the tool sticky on validation hint — clear partial picks.
           setPendingRefs([]);
           return;
         }
@@ -1566,7 +1793,6 @@ export function Sketcher({
         }
       } else {
         flashHint('Pick two points, two parallel lines, or a point and a line.');
-        setPendingConstraint(null);
         setPendingRefs([]);
         return;
       }
@@ -1578,19 +1804,25 @@ export function Sketcher({
       // Re-solve the current shapes against the new constraint set.
       applyShapes((p) => p, [next]);
     }
-    setPendingConstraint(null);
+    // Sticky tool: keep `pendingConstraint` set so the user can chain
+    // multiple constraints. ESC or selecting a different toolbar button
+    // exits — both already handled by the existing keyboard / button logic.
     setPendingRefs([]);
     setPendingHover(null);
   };
 
   const nearestRectEdge = (
-    r: { x: number; y: number; width: number; height: number },
+    r: { x: number; y: number; width: number; height: number; angle?: number },
     p: Pt
   ): 'top' | 'bottom' | 'left' | 'right' => {
-    const dTop = Math.abs(p.y - (r.y + r.height));
-    const dBot = Math.abs(p.y - r.y);
-    const dLeft = Math.abs(p.x - r.x);
-    const dRight = Math.abs(p.x - (r.x + r.width));
+    // The cursor is in world coords; transform it into the rect's
+    // pre-rotation frame so the edge comparisons are axis-aligned.
+    const c = rectCenter(r);
+    const local = rotatePoint(p, c, -(r.angle ?? 0));
+    const dTop = Math.abs(local.y - (r.y + r.height));
+    const dBot = Math.abs(local.y - r.y);
+    const dLeft = Math.abs(local.x - r.x);
+    const dRight = Math.abs(local.x - (r.x + r.width));
     const m = Math.min(dTop, dBot, dLeft, dRight);
     if (m === dTop) return 'top';
     if (m === dBot) return 'bottom';
@@ -1660,14 +1892,17 @@ export function Sketcher({
         );
         consider({ kind: 'line', shapeId: s.id }, d);
       } else if (s.type === 'rect' || s.type === 'rounded-rect') {
-        const x0 = s.x;
-        const y0 = s.y;
-        const x1 = s.x + s.width;
-        const y1 = s.y + s.height;
-        const dT = pointToSegmentDist(cursor, { x: x0, y: y1 }, { x: x1, y: y1 });
-        const dB = pointToSegmentDist(cursor, { x: x0, y: y0 }, { x: x1, y: y0 });
-        const dL = pointToSegmentDist(cursor, { x: x0, y: y0 }, { x: x0, y: y1 });
-        const dR = pointToSegmentDist(cursor, { x: x1, y: y0 }, { x: x1, y: y1 });
+        const c = rectCenter(s);
+        const a = s.angle ?? 0;
+        const rot = (p: Pt) => rotatePoint(p, c, a);
+        const tl = rot({ x: s.x, y: s.y + s.height });
+        const tr = rot({ x: s.x + s.width, y: s.y + s.height });
+        const br = rot({ x: s.x + s.width, y: s.y });
+        const bl = rot({ x: s.x, y: s.y });
+        const dT = pointToSegmentDist(cursor, tl, tr);
+        const dB = pointToSegmentDist(cursor, bl, br);
+        const dL = pointToSegmentDist(cursor, bl, tl);
+        const dR = pointToSegmentDist(cursor, br, tr);
         consider({ kind: 'edge', shapeId: s.id, edge: 'top' }, dT);
         consider({ kind: 'edge', shapeId: s.id, edge: 'bottom' }, dB);
         consider({ kind: 'edge', shapeId: s.id, edge: 'left' }, dL);
@@ -1737,11 +1972,14 @@ export function Sketcher({
     };
     for (const s of shapes) {
       if (s.type === 'rect' || s.type === 'rounded-rect') {
-        consider({ kind: 'point', shapeId: s.id, role: 'tl' }, d({ x: s.x, y: s.y + s.height }));
-        consider({ kind: 'point', shapeId: s.id, role: 'tr' }, d({ x: s.x + s.width, y: s.y + s.height }));
-        consider({ kind: 'point', shapeId: s.id, role: 'br' }, d({ x: s.x + s.width, y: s.y }));
-        consider({ kind: 'point', shapeId: s.id, role: 'bl' }, d({ x: s.x, y: s.y }));
-        consider({ kind: 'point', shapeId: s.id, role: 'center' }, d({ x: s.x + s.width / 2, y: s.y + s.height / 2 }));
+        const c = rectCenter(s);
+        const a = s.angle ?? 0;
+        const rot = (p: Pt) => rotatePoint(p, c, a);
+        consider({ kind: 'point', shapeId: s.id, role: 'tl' }, d(rot({ x: s.x, y: s.y + s.height })));
+        consider({ kind: 'point', shapeId: s.id, role: 'tr' }, d(rot({ x: s.x + s.width, y: s.y + s.height })));
+        consider({ kind: 'point', shapeId: s.id, role: 'br' }, d(rot({ x: s.x + s.width, y: s.y })));
+        consider({ kind: 'point', shapeId: s.id, role: 'bl' }, d(rot({ x: s.x, y: s.y })));
+        consider({ kind: 'point', shapeId: s.id, role: 'center' }, d(c));
       } else if (s.type === 'circle') {
         consider({ kind: 'point', shapeId: s.id, role: 'center' }, d({ x: s.cx, y: s.cy }));
       } else if (s.type === 'arc') {
@@ -1836,10 +2074,13 @@ export function Sketcher({
     }
     if (ref.kind === 'edge' && (s.type === 'rect' || s.type === 'rounded-rect')) {
       const w = s.width, h = s.height;
-      if (ref.edge === 'top') return { p1: { x: s.x, y: s.y + h }, p2: { x: s.x + w, y: s.y + h } };
-      if (ref.edge === 'bottom') return { p1: { x: s.x, y: s.y }, p2: { x: s.x + w, y: s.y } };
-      if (ref.edge === 'left') return { p1: { x: s.x, y: s.y }, p2: { x: s.x, y: s.y + h } };
-      if (ref.edge === 'right') return { p1: { x: s.x + w, y: s.y }, p2: { x: s.x + w, y: s.y + h } };
+      const c = rectCenter(s);
+      const a = s.angle ?? 0;
+      const rot = (p: Pt) => rotatePoint(p, c, a);
+      if (ref.edge === 'top') return { p1: rot({ x: s.x, y: s.y + h }), p2: rot({ x: s.x + w, y: s.y + h }) };
+      if (ref.edge === 'bottom') return { p1: rot({ x: s.x, y: s.y }), p2: rot({ x: s.x + w, y: s.y }) };
+      if (ref.edge === 'left') return { p1: rot({ x: s.x, y: s.y }), p2: rot({ x: s.x, y: s.y + h }) };
+      if (ref.edge === 'right') return { p1: rot({ x: s.x + w, y: s.y }), p2: rot({ x: s.x + w, y: s.y + h }) };
     }
     return null;
   };
@@ -1908,12 +2149,14 @@ export function Sketcher({
           y: s.cy + s.radius * Math.sin(s.endAngle),
         };
     } else if (s.type === 'rect' || s.type === 'rounded-rect') {
-      if (ref.role === 'tl') return { x: s.x, y: s.y + s.height };
-      if (ref.role === 'tr') return { x: s.x + s.width, y: s.y + s.height };
-      if (ref.role === 'br') return { x: s.x + s.width, y: s.y };
-      if (ref.role === 'bl') return { x: s.x, y: s.y };
-      if (ref.role === 'center')
-        return { x: s.x + s.width / 2, y: s.y + s.height / 2 };
+      const c = rectCenter(s);
+      const a = s.angle ?? 0;
+      const rot = (p: Pt) => rotatePoint(p, c, a);
+      if (ref.role === 'tl') return rot({ x: s.x, y: s.y + s.height });
+      if (ref.role === 'tr') return rot({ x: s.x + s.width, y: s.y + s.height });
+      if (ref.role === 'br') return rot({ x: s.x + s.width, y: s.y });
+      if (ref.role === 'bl') return rot({ x: s.x, y: s.y });
+      if (ref.role === 'center') return c;
     } else if (s.type === 'polyline' && ref.role === 'vertex' && ref.vertexIdx != null) {
       return s.points[ref.vertexIdx] ?? null;
     }
@@ -1927,23 +2170,26 @@ export function Sketcher({
   // plus the center so the picker matches what the user clicked instead of
   // always returning 'tl'.
   const nearestRectPointRole = (
-    s: { x: number; y: number; width: number; height: number },
+    s: { x: number; y: number; width: number; height: number; angle?: number },
     cursor: Pt
   ): 'tl' | 'tr' | 'br' | 'bl' | 'center' => {
+    const c = rectCenter(s);
+    const a = s.angle ?? 0;
+    const rot = (p: Pt) => rotatePoint(p, c, a);
     const cands: { role: 'tl' | 'tr' | 'br' | 'bl' | 'center'; pt: Pt }[] = [
-      { role: 'tl', pt: { x: s.x, y: s.y + s.height } },
-      { role: 'tr', pt: { x: s.x + s.width, y: s.y + s.height } },
-      { role: 'br', pt: { x: s.x + s.width, y: s.y } },
-      { role: 'bl', pt: { x: s.x, y: s.y } },
-      { role: 'center', pt: { x: s.x + s.width / 2, y: s.y + s.height / 2 } },
+      { role: 'tl', pt: rot({ x: s.x, y: s.y + s.height }) },
+      { role: 'tr', pt: rot({ x: s.x + s.width, y: s.y + s.height }) },
+      { role: 'br', pt: rot({ x: s.x + s.width, y: s.y }) },
+      { role: 'bl', pt: rot({ x: s.x, y: s.y }) },
+      { role: 'center', pt: c },
     ];
     let best = cands[0];
     let bestD = Infinity;
-    for (const c of cands) {
-      const d = Math.hypot(c.pt.x - cursor.x, c.pt.y - cursor.y);
+    for (const cand of cands) {
+      const d = Math.hypot(cand.pt.x - cursor.x, cand.pt.y - cursor.y);
       if (d < bestD) {
         bestD = d;
-        best = c;
+        best = cand;
       }
     }
     return best.role;
@@ -2030,10 +2276,28 @@ export function Sketcher({
     return null;
   };
 
+  /**
+   * Effective arity for the current constraint pick. `horizontal` and
+   * `vertical` accept two shapes:
+   *   - a single line / rect-edge → orient that segment
+   *   - two points → align them so they share an x or y coord (first
+   *     point moves to satisfy)
+   * The picker promotes the arity to 2 once the first ref is a point.
+   */
+  const effectiveArity = (type: ConstraintType, refs: EntityRef[]): number => {
+    if ((type === 'horizontal' || type === 'vertical') && refs.length >= 1) {
+      return refs[0].kind === 'point' ? 2 : 1;
+    }
+    return arity(type);
+  };
+
   const offerRef = (ref: EntityRef) => {
     if (!pendingConstraint) return;
     const refs = [...pendingRefs, ref];
-    if (refs.length >= arity(pendingConstraint) && canCreate(pendingConstraint, refs)) {
+    if (
+      refs.length >= effectiveArity(pendingConstraint, refs) &&
+      canCreate(pendingConstraint, refs)
+    ) {
       finalizeConstraint(pendingConstraint, refs);
     } else {
       setPendingRefs(refs);
@@ -2180,7 +2444,8 @@ export function Sketcher({
     setShapes((prev) => [...prev, { id, type: 'polyline', points, closed, operation: 'add' }]);
     setPolyDraft(null);
     setSelectedId(id);
-    setTool('select');
+    // Sticky tool: stay on the polyline tool so the user can draw
+    // another. Esc or picking a different tool exits.
   };
 
   // ---- Pan / zoom ----
@@ -2261,6 +2526,51 @@ export function Sketcher({
               ? 'Tangent: pick a line/edge for the second target.'
               : 'Tangent: pick a circle / arc for the second target.'
           );
+        }
+      }
+      return;
+    }
+
+    // Angle: two lines / rect-edges (or axes — all are line-like). The
+    // lines don't need to be near each other — we just look up the
+    // nearest line under the cursor for each click.
+    if (pendingConstraint === 'angle') {
+      const tolMm = 8 / screenScale;
+      const hit = nearestPickableLine(pt);
+      if (hit && hit.dist <= tolMm) {
+        const dup = pendingRefs.some((r) => sameRef(r, hit.ref));
+        if (!dup) {
+          e.cancelBubble = true;
+          offerRef(hit.ref);
+        }
+      }
+      return;
+    }
+
+    // Horizontal / vertical: accept either a line / rect-edge (orient that
+    // segment) OR a pair of points (align them). We use the same hybrid
+    // picker as Distance for the first click — it returns whichever is
+    // closer, line-like or point. Once the first ref is a point we
+    // require the second to be a point too.
+    if (pendingConstraint === 'horizontal' || pendingConstraint === 'vertical') {
+      const tolMm = 8 / screenScale;
+      const pointTolMm = 6 / screenScale;
+      const havePoint =
+        pendingRefs.length === 1 && pendingRefs[0].kind === 'point';
+      let hit: { ref: EntityRef; dist: number } | null = null;
+      if (havePoint) {
+        // Second click must be a point.
+        const ph = nearestPickablePoint(pt);
+        if (ph && ph.dist <= 12 / screenScale) hit = ph;
+      } else {
+        // First click — prefer line/edge but accept a point too.
+        hit = nearestPickableForDistance(pt, pointTolMm);
+      }
+      if (hit && hit.dist <= tolMm) {
+        const dup = pendingRefs.some((r) => sameRef(r, hit.ref));
+        if (!dup) {
+          e.cancelBubble = true;
+          offerRef(hit.ref);
         }
       }
       return;
@@ -2364,7 +2674,15 @@ export function Sketcher({
         if (polyDraft.points.length >= 2 && dist(first, pt) <= CLOSE_THRESHOLD_MM) {
           commitPolyline(polyDraft.points, true);
         } else {
-          setPolyDraft({ points: [...polyDraft.points, pt], preview: pt });
+          // Apply 5° angle snap relative to the previous segment, unless
+          // shift is held or the cursor already snapped to an existing
+          // feature point (we don't want to override a snap target).
+          const shiftHeld = !!e.evt?.shiftKey;
+          const skipAngle = shiftHeld || lastSnapRefRef.current !== null;
+          const placed = skipAngle
+            ? pt
+            : applyPolyAngleSnap(polyDraft.points, pt).pt;
+          setPolyDraft({ points: [...polyDraft.points, placed], preview: placed });
         }
       }
     }
@@ -2475,6 +2793,42 @@ export function Sketcher({
       ) {
         setPendingHover(desired);
       }
+    } else if (pendingConstraint === 'angle') {
+      const tolMm = 8 / screenScale;
+      const hit = nearestPickableLine(pt);
+      const next = hit && hit.dist <= tolMm ? hit.ref : null;
+      const dup = next && pendingRefs.some((r) => sameRef(r, next));
+      const desired = dup ? null : next;
+      if (
+        (desired === null) !== (pendingHover === null) ||
+        (desired && pendingHover && !sameRef(desired, pendingHover))
+      ) {
+        setPendingHover(desired);
+      }
+    } else if (
+      pendingConstraint === 'horizontal' ||
+      pendingConstraint === 'vertical'
+    ) {
+      const tolMm = 8 / screenScale;
+      const pointTolMm = 6 / screenScale;
+      const havePoint =
+        pendingRefs.length === 1 && pendingRefs[0].kind === 'point';
+      let hit: { ref: EntityRef; dist: number } | null = null;
+      if (havePoint) {
+        const ph = nearestPickablePoint(pt);
+        if (ph && ph.dist <= 12 / screenScale) hit = ph;
+      } else {
+        hit = nearestPickableForDistance(pt, pointTolMm);
+      }
+      const next = hit && hit.dist <= tolMm ? hit.ref : null;
+      const dup = next && pendingRefs.some((r) => sameRef(r, next));
+      const desired = dup ? null : next;
+      if (
+        (desired === null) !== (pendingHover === null) ||
+        (desired && pendingHover && !sameRef(desired, pendingHover))
+      ) {
+        setPendingHover(desired);
+      }
     } else if (pendingHover) {
       setPendingHover(null);
     }
@@ -2494,7 +2848,12 @@ export function Sketcher({
       setArcCursor(pt);
     }
     if (polyDraft) {
-      setPolyDraft({ ...polyDraft, preview: pt });
+      const shiftHeld = !!e.evt?.shiftKey;
+      const skipAngle = shiftHeld || lastSnapRefRef.current !== null;
+      const preview = skipAngle
+        ? pt
+        : applyPolyAngleSnap(polyDraft.points, pt).pt;
+      setPolyDraft({ ...polyDraft, preview });
     }
   };
 
@@ -2555,7 +2914,9 @@ export function Sketcher({
         setShapes((prev) => [...prev, s]);
       }
       setSelectedId(s.id);
-      setTool('select');
+      // Sticky tool: stay on the active drawing tool so the user can
+      // draw another of the same kind. Esc or picking a different tool
+      // exits back to select.
     }
     setDraft(null);
     draftSnapRefsRef.current = {};
@@ -2578,6 +2939,10 @@ export function Sketcher({
           setArcCursor(null);
         }
         else if (draft) setDraft(null);
+        // Sticky drawing tool with nothing in flight → exit back to
+        // select. Without this the user couldn't get out of e.g. the
+        // rect tool except by clicking the select button.
+        else if (tool !== 'select') setTool('select');
         else if (selectedId) setSelectedId(null);
         else onCancel();
       } else if (e.key === 'Enter' && polyDraft && polyDraft.points.length >= 2) {
@@ -2588,7 +2953,7 @@ export function Sketcher({
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [polyDraft, arcDraft, draft, selectedId, onCancel]);
+  }, [polyDraft, arcDraft, draft, selectedId, tool, onCancel]);
 
   // ---- Save ----
   const handleSave = () => {
@@ -2617,6 +2982,7 @@ export function Sketcher({
           y: s.y + s.height / 2,
           width: s.width,
           height: s.height,
+          angle: s.angle ?? 0,
           operation: s.operation,
         });
       } else if (s.type === 'rounded-rect' && s.width > 0 && s.height > 0) {
@@ -2628,6 +2994,7 @@ export function Sketcher({
           width: s.width,
           height: s.height,
           cornerRadius: Math.max(0, Math.min(s.cornerRadius, Math.min(s.width, s.height) / 2)),
+          angle: s.angle ?? 0,
           operation: s.operation,
         });
       } else if (s.type === 'circle' && s.radius > 0) {
@@ -2654,6 +3021,9 @@ export function Sketcher({
     switch (c.type) {
       case 'horizontal':
       case 'vertical':
+        // Two equally-valid shapes for these: single line/edge ref, or
+        // a pair of points. Discriminate at runtime.
+        return 'a' in c && 'b' in c ? [c.a, c.b] : [(c as { ref: EntityRef }).ref];
       case 'fix':
       case 'length':
       case 'radius':
@@ -2844,7 +3214,10 @@ export function Sketcher({
           pendingConstraint === 'distance' ||
           pendingConstraint === 'coincident' ||
           pendingConstraint === 'fix' ||
-          pendingConstraint === 'tangent'
+          pendingConstraint === 'tangent' ||
+          pendingConstraint === 'horizontal' ||
+          pendingConstraint === 'vertical' ||
+          pendingConstraint === 'angle'
         ) {
           return;
         }
@@ -2868,11 +3241,19 @@ export function Sketcher({
     };
 
     if (s.type === 'rect') {
+      // Rotation is around the rect's center. Konva's `rotation` rotates
+      // around (x, y); to rotate around center we move x/y to the center
+      // and use offset = (w/2, h/2) so the visual top-left lands back at
+      // the original (s.x, s.y) when angle=0.
+      const angleDeg = ((s.angle ?? 0) * 180) / Math.PI;
       return (
         <Rect
           key={s.id}
-          x={s.x}
-          y={s.y}
+          x={s.x + s.width / 2}
+          y={s.y + s.height / 2}
+          offsetX={s.width / 2}
+          offsetY={s.height / 2}
+          rotation={angleDeg}
           width={s.width}
           height={s.height}
           fill={fillFor(s, isSelected)}
@@ -2883,19 +3264,27 @@ export function Sketcher({
           onTap={select}
           draggable={tool === 'select' && !pinnedShapeIds.has(s.id)}
           onDragStart={() => setSelectedId(s.id)}
-          // dragBoundFunc runs every drag step BEFORE Konva commits the
-          // new position. Returning the snapped + solved position keeps
-          // Konva and React state in sync (avoids the body-vs-handles
-          // desync caused by the solver overriding our position late).
+          // Konva reports position as the rect's center because of our
+          // offset trick. Convert it back to the bottom-left anchor we
+          // store before running the constraint solver, and likewise
+          // back to a center for the value Konva needs.
           dragBoundFunc={(absPos) => {
             const target = absToWorld(absPos);
-            const constrained = constrainBodyDrag(s.id, target, 'rect');
-            return worldToAbs(constrained);
+            const cornerTarget = {
+              x: target.x - s.width / 2,
+              y: target.y - s.height / 2,
+            };
+            const corner = constrainBodyDrag(s.id, cornerTarget, 'rect');
+            return worldToAbs({
+              x: corner.x + s.width / 2,
+              y: corner.y + s.height / 2,
+            });
           }}
           onDragMove={(e) => {
-            // The position has already been constrained — commit state
-            // with whatever Konva ended up applying.
-            updateShape(s.id, { x: e.target.x(), y: e.target.y() });
+            updateShape(s.id, {
+              x: e.target.x() - s.width / 2,
+              y: e.target.y() - s.height / 2,
+            });
           }}
           onDragEnd={() => setSnapHint(null)}
           onDblClick={(e: any) => {
@@ -2913,11 +3302,15 @@ export function Sketcher({
     if (s.type === 'rounded-rect') {
       // Konva clamps cornerRadius at min(width, height) / 2.
       const cap = Math.max(0, Math.min(s.cornerRadius, Math.min(s.width, s.height) / 2));
+      const angleDeg = ((s.angle ?? 0) * 180) / Math.PI;
       return (
         <Rect
           key={s.id}
-          x={s.x}
-          y={s.y}
+          x={s.x + s.width / 2}
+          y={s.y + s.height / 2}
+          offsetX={s.width / 2}
+          offsetY={s.height / 2}
+          rotation={angleDeg}
           width={s.width}
           height={s.height}
           cornerRadius={cap}
@@ -2931,11 +3324,21 @@ export function Sketcher({
           onDragStart={() => setSelectedId(s.id)}
           dragBoundFunc={(absPos) => {
             const target = absToWorld(absPos);
-            const constrained = constrainBodyDrag(s.id, target, 'rounded-rect');
-            return worldToAbs(constrained);
+            const cornerTarget = {
+              x: target.x - s.width / 2,
+              y: target.y - s.height / 2,
+            };
+            const corner = constrainBodyDrag(s.id, cornerTarget, 'rounded-rect');
+            return worldToAbs({
+              x: corner.x + s.width / 2,
+              y: corner.y + s.height / 2,
+            });
           }}
           onDragMove={(e) => {
-            updateShape(s.id, { x: e.target.x(), y: e.target.y() });
+            updateShape(s.id, {
+              x: e.target.x() - s.width / 2,
+              y: e.target.y() - s.height / 2,
+            });
           }}
           onDragEnd={() => setSnapHint(null)}
         />
@@ -3083,11 +3486,17 @@ export function Sketcher({
     );
 
     if (s.type === 'rect') {
-      const corners: { key: 'tl' | 'tr' | 'br' | 'bl'; p: Pt }[] = [
-        { key: 'tl', p: { x: s.x, y: s.y } },
-        { key: 'tr', p: { x: s.x + s.width, y: s.y } },
-        { key: 'br', p: { x: s.x + s.width, y: s.y + s.height } },
-        { key: 'bl', p: { x: s.x, y: s.y + s.height } },
+      // Local corner positions in the rect's pre-rotation frame; we
+      // render them at world-space rotated positions, but the user's
+      // drag deltas are interpreted in local space so resizing still
+      // behaves like a normal axis-aligned rect.
+      const center = rectCenter(s);
+      const angle = s.angle ?? 0;
+      const corners: { key: 'tl' | 'tr' | 'br' | 'bl'; local: Pt }[] = [
+        { key: 'tl', local: { x: s.x, y: s.y } },
+        { key: 'tr', local: { x: s.x + s.width, y: s.y } },
+        { key: 'br', local: { x: s.x + s.width, y: s.y + s.height } },
+        { key: 'bl', local: { x: s.x, y: s.y + s.height } },
       ];
       const opps = {
         tl: { x: s.x + s.width, y: s.y + s.height },
@@ -3095,23 +3504,28 @@ export function Sketcher({
         br: { x: s.x, y: s.y },
         bl: { x: s.x + s.width, y: s.y },
       } as const;
-      return corners.map((c) =>
-        Handle(c.key, c.p, (np) => {
+      return corners.map((c) => {
+        const world = rotatePoint(c.local, center, angle);
+        return Handle(c.key, world, (np) => {
+          // Convert world drag back to local space.
+          const localNp = rotatePoint(np, center, -angle);
           const opp = opps[c.key];
-          const nx = Math.min(np.x, opp.x);
-          const ny = Math.min(np.y, opp.y);
-          const nw = Math.abs(np.x - opp.x);
-          const nh = Math.abs(np.y - opp.y);
+          const nx = Math.min(localNp.x, opp.x);
+          const ny = Math.min(localNp.y, opp.y);
+          const nw = Math.abs(localNp.x - opp.x);
+          const nh = Math.abs(localNp.y - opp.y);
           updateShape(s.id, { x: nx, y: ny, width: nw, height: nh });
-        })
-      );
+        });
+      });
     }
     if (s.type === 'rounded-rect') {
-      const corners: { key: 'tl' | 'tr' | 'br' | 'bl'; p: Pt }[] = [
-        { key: 'tl', p: { x: s.x, y: s.y } },
-        { key: 'tr', p: { x: s.x + s.width, y: s.y } },
-        { key: 'br', p: { x: s.x + s.width, y: s.y + s.height } },
-        { key: 'bl', p: { x: s.x, y: s.y + s.height } },
+      const center = rectCenter(s);
+      const angle = s.angle ?? 0;
+      const corners: { key: 'tl' | 'tr' | 'br' | 'bl'; local: Pt }[] = [
+        { key: 'tl', local: { x: s.x, y: s.y } },
+        { key: 'tr', local: { x: s.x + s.width, y: s.y } },
+        { key: 'br', local: { x: s.x + s.width, y: s.y + s.height } },
+        { key: 'bl', local: { x: s.x, y: s.y + s.height } },
       ];
       const opps = {
         tl: { x: s.x + s.width, y: s.y + s.height },
@@ -3119,25 +3533,27 @@ export function Sketcher({
         br: { x: s.x, y: s.y },
         bl: { x: s.x + s.width, y: s.y },
       } as const;
-      // Capped corner radius for the radius-control handle (top-left, offset
-      // diagonally inward by `cornerRadius`).
       const cap = Math.max(0, Math.min(s.cornerRadius, Math.min(s.width, s.height) / 2));
-      const cornerHandles = corners.map((c) =>
-        Handle(c.key, c.p, (np) => {
+      const cornerHandles = corners.map((c) => {
+        const world = rotatePoint(c.local, center, angle);
+        return Handle(c.key, world, (np) => {
+          const localNp = rotatePoint(np, center, -angle);
           const opp = opps[c.key];
-          const nx = Math.min(np.x, opp.x);
-          const ny = Math.min(np.y, opp.y);
-          const nw = Math.abs(np.x - opp.x);
-          const nh = Math.abs(np.y - opp.y);
+          const nx = Math.min(localNp.x, opp.x);
+          const ny = Math.min(localNp.y, opp.y);
+          const nw = Math.abs(localNp.x - opp.x);
+          const nh = Math.abs(localNp.y - opp.y);
           updateShape(s.id, { x: nx, y: ny, width: nw, height: nh });
-        })
-      );
-      // Radius control handle: drag along the top edge from the TL corner.
-      // Distance from TL controls cornerRadius (clamped to half the smaller
-      // side). Render it offset toward +x from the TL inside corner.
-      const radiusHandlePos: Pt = { x: s.x + cap, y: s.y };
+        });
+      });
+      // Radius control handle: drag along the (rotated) top edge from
+      // the TL corner. Distance from TL along the rotated +X controls
+      // cornerRadius (clamped to half the smaller side).
+      const radiusHandleLocal: Pt = { x: s.x + cap, y: s.y };
+      const radiusHandlePos = rotatePoint(radiusHandleLocal, center, angle);
       const radiusHandle = Handle('rr-radius', radiusHandlePos, (np) => {
-        const r = Math.max(0, Math.min(np.x - s.x, Math.min(s.width, s.height) / 2));
+        const localNp = rotatePoint(np, center, -angle);
+        const r = Math.max(0, Math.min(localNp.x - s.x, Math.min(s.width, s.height) / 2));
         updateShape(s.id, { cornerRadius: r });
       });
       return [...cornerHandles, radiusHandle];
@@ -3915,16 +4331,34 @@ export function Sketcher({
 
   const renderPolyDraftCallout = () => {
     if (!polyDraft || polyDraft.points.length === 0) return null;
-    const last = polyDraft.points[polyDraft.points.length - 1];
+    const pts = polyDraft.points;
+    const last = pts[pts.length - 1];
     const mid = { x: (last.x + polyDraft.preview.x) / 2, y: (last.y + polyDraft.preview.y) / 2 };
     const m = projectToScreen(mid);
     const len = dist(last, polyDraft.preview);
+    // Angle of the *new* segment relative to the previous one — only
+    // meaningful when there's a previous segment to compare against.
+    let angleStr = '';
+    if (pts.length >= 2) {
+      const prev2 = pts[pts.length - 2];
+      const prevAngle = Math.atan2(last.y - prev2.y, last.x - prev2.x);
+      const dx = polyDraft.preview.x - last.x;
+      const dy = polyDraft.preview.y - last.y;
+      if (Math.hypot(dx, dy) > 1e-6) {
+        const curAngle = Math.atan2(dy, dx);
+        let rel = curAngle - prevAngle;
+        while (rel > Math.PI) rel -= 2 * Math.PI;
+        while (rel <= -Math.PI) rel += 2 * Math.PI;
+        const deg = (rel * 180) / Math.PI;
+        angleStr = `  ·  ${deg.toFixed(deg === Math.round(deg) ? 0 : 1)}°`;
+      }
+    }
     return (
       <Text
         key="draft-poly"
         x={m.sx + 8}
         y={m.sy - 6}
-        text={`${len.toFixed(1)} mm`}
+        text={`${len.toFixed(1)} mm${angleStr}`}
         fontSize={11}
         fontFamily="ui-monospace, monospace"
         fill="#fbbf24"
@@ -4186,6 +4620,23 @@ export function Sketcher({
     if (pendingHint) return pendingHint;
     if (pendingConstraint) {
       const need = arity(pendingConstraint) - pendingRefs.length;
+      if (pendingConstraint === 'horizontal' || pendingConstraint === 'vertical') {
+        // Dual-mode picker: line/edge OR point pair.
+        if (pendingRefs.length === 0) {
+          return `${pendingConstraint}: pick a line/edge to orient, OR a point to start a pair. Esc exits.`;
+        }
+        if (pendingRefs.length === 1 && pendingRefs[0].kind === 'point') {
+          return `${pendingConstraint}: pick the second point — first one moves to align. Esc exits.`;
+        }
+      }
+      if (pendingConstraint === 'angle') {
+        if (pendingRefs.length === 0) {
+          return 'angle: pick the line that should rotate to satisfy the angle. Esc exits.';
+        }
+        if (pendingRefs.length === 1) {
+          return 'angle: pick the reference line. Esc exits.';
+        }
+      }
       if (pendingConstraint === 'tangent') {
         // Tangent's two picks have different shapes (line + circle) — be
         // specific about which is still missing.
@@ -4219,7 +4670,7 @@ export function Sketcher({
       return 'Click start, end, then a third point on the curve (3 clicks).';
     if (tool === 'line') return 'Drag from start to end.';
     if (tool === 'polyline')
-      return 'Click to add points · Enter to finish open · Click first point to close.';
+      return 'Click to add points · Enter finishes open · Click first point to close · 5° angle snap (Shift to disable).';
     return selectedShape
       ? 'Drag handles to reshape · Drag body to move · Del to remove.'
       : 'Click a shape to select.';
@@ -4240,7 +4691,7 @@ export function Sketcher({
             <div className="flex bg-slate-700/50 rounded-md p-1 gap-1">
               <ToolBtn name="select" icon={<MousePointer2 size={14} />} label="Select" />
               <ToolBtn name="rect" icon={<Square size={14} />} label="Rect" />
-              <ToolBtn name="rounded-rect" icon={<Square size={14} />} label="RRect" />
+              <ToolBtn name="rounded-rect" icon={<RoundedRectIcon size={14} />} label="RRect" />
               <ToolBtn name="circle" icon={<CircleIcon size={14} />} label="Circle" />
               <ToolBtn name="arc" icon={<ArcIcon size={14} />} label="Arc" />
               <ToolBtn name="line" icon={<Slash size={14} />} label="Line" />
@@ -4252,6 +4703,7 @@ export function Sketcher({
               <ConstraintBtn type="fix" icon={<Lock size={14} />} label="Fix" />
               <ConstraintBtn type="coincident" icon={<Link size={14} />} label="Coincident" />
               <ConstraintBtn type="distance" icon={<Ruler size={14} />} label="Distance" />
+              <ConstraintBtn type="angle" icon={<Triangle size={14} />} label="Angle" />
               <ConstraintBtn type="tangent" icon={<Slash size={14} />} label="Tangent" />
             </div>
             <div className="text-[11px] text-slate-500 truncate hidden md:block">{hint}</div>
@@ -4303,6 +4755,53 @@ export function Sketcher({
                 {renderDraftCallout()}
                 {renderPolyDraftCallout()}
                 {renderWorldAxes()}
+                {originMarker && (() => {
+                  // Crosshair + ring + label at the sketch origin —
+                  // signals where the picked edge passes through the
+                  // perpendicular sketch plane during a sweep.
+                  const sx = size.w / 2 + view.panX;
+                  const sy = size.h / 2 + view.panY;
+                  const color = originMarker.color ?? '#22c55e';
+                  const R = 12;
+                  return (
+                    <>
+                      <KCircle
+                        key="origin-marker-ring"
+                        x={sx}
+                        y={sy}
+                        radius={R}
+                        stroke={color}
+                        strokeWidth={2}
+                        listening={false}
+                      />
+                      <KLine
+                        key="origin-marker-cross-h"
+                        points={[sx - R - 4, sy, sx + R + 4, sy]}
+                        stroke={color}
+                        strokeWidth={1.5}
+                        listening={false}
+                      />
+                      <KLine
+                        key="origin-marker-cross-v"
+                        points={[sx, sy - R - 4, sx, sy + R + 4]}
+                        stroke={color}
+                        strokeWidth={1.5}
+                        listening={false}
+                      />
+                      <Text
+                        key="origin-marker-label"
+                        x={sx + R + 6}
+                        y={sy - R - 14}
+                        text={originMarker.label}
+                        fontSize={11}
+                        fontFamily="ui-monospace, monospace"
+                        fontStyle="bold"
+                        fill={color}
+                        listening={false}
+                      />
+                    </>
+                  );
+                })()}
               </Layer>
               {/* Listening layer for dimension graphics (label dbl-click → edit value). */}
               <Layer>
@@ -4413,6 +4912,15 @@ export function Sketcher({
                       onUnlockField={(field) =>
                         unlockShapeField(selectedShape, field)
                       }
+                      onRotateBy={(deltaRad) =>
+                        applyShapes((prev) =>
+                          prev.map((s) =>
+                            s.id === selectedShape.id
+                              ? rotateShapeBy(s, deltaRad)
+                              : s
+                          )
+                        )
+                      }
                       lockedFields={lockedFields}
                     />
                   )}
@@ -4441,6 +4949,7 @@ export function Sketcher({
                     // applyShapes — applyShapes runs solve synchronously off
                     // constraintsRef, so we'd otherwise solve against the
                     // stale value from the previous render.
+                    const oldC = constraints.find((c) => c.id === id);
                     const updated = constraints.map((c) => {
                       if (c.id !== id) return c;
                       if (
@@ -4457,7 +4966,31 @@ export function Sketcher({
                     });
                     setConstraints(updated);
                     constraintsRef.current = updated;
-                    applyShapes((p) => p);
+                    // Angle: pre-rotate the first-picked line by the
+                    // delta so it visibly moves to satisfy the new
+                    // target. Without this nudge the LM solver would
+                    // distribute the change between A and B based on
+                    // gradient — not what the user expects when they
+                    // explicitly picked A as the moving entity.
+                    if (
+                      oldC &&
+                      oldC.type === 'angle' &&
+                      Math.abs(oldC.value - value) > 1e-9
+                    ) {
+                      const delta = value - oldC.value;
+                      const aRef = oldC.a;
+                      applyShapes((prev) =>
+                        prev.map((s) =>
+                          s.id === aRef.shapeId &&
+                          s.type === 'line' &&
+                          !s.frozen
+                            ? (rotateShapeBy(s, delta) as Shape)
+                            : s
+                        )
+                      );
+                    } else {
+                      applyShapes((p) => p);
+                    }
                     const ls = lastSolveRef.current;
                     if (ls && !ls.converged) {
                       flashHint(
@@ -4553,6 +5086,7 @@ function ConstraintsPanel({
     switch (c.type) {
       case 'horizontal':
       case 'vertical':
+        return 'a' in c && 'b' in c ? [c.a, c.b] : [(c as { ref: EntityRef }).ref];
       case 'fix':
       case 'length':
       case 'radius':
@@ -4662,12 +5196,22 @@ function ConstraintsPanel({
                 <span className="text-[10px] uppercase tracking-wider text-slate-500">
                   Value
                 </span>
-                <NumInput
-                  value={v}
-                  onCommit={(nv) => onUpdateValue(c.id, nv)}
-                  className="flex-1 px-2 py-1 bg-slate-900/50 rounded text-slate-100 font-mono text-right text-[11px] focus:outline-none focus:ring-1 focus:ring-blue-500"
-                />
-                <span className="text-[10px] text-slate-500">mm</span>
+                {c.type === 'angle' ? (
+                  <NumInput
+                    value={(v * 180) / Math.PI}
+                    onCommit={(nv) => onUpdateValue(c.id, (nv * Math.PI) / 180)}
+                    className="flex-1 px-2 py-1 bg-slate-900/50 rounded text-slate-100 font-mono text-right text-[11px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  />
+                ) : (
+                  <NumInput
+                    value={v}
+                    onCommit={(nv) => onUpdateValue(c.id, nv)}
+                    className="flex-1 px-2 py-1 bg-slate-900/50 rounded text-slate-100 font-mono text-right text-[11px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  />
+                )}
+                <span className="text-[10px] text-slate-500">
+                  {c.type === 'angle' ? '°' : 'mm'}
+                </span>
               </div>
             )}
             {dangling && (
@@ -4956,12 +5500,53 @@ function InsetOutsetTool({
   );
 }
 
+/**
+ * Compact rotate-by widget used in the property panel for shapes whose
+ * rotation isn't a single numeric field (lines / polylines / arcs).
+ * `-90°` and `+90°` quick buttons + a custom-degree input.
+ */
+function RotateControl({ onRotateBy }: { onRotateBy: (deg: number) => void }) {
+  return (
+    <div className="space-y-1 pt-2 border-t border-slate-700">
+      <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+        Rotate
+      </div>
+      <div className="flex gap-1 items-center">
+        <button
+          type="button"
+          onClick={() => onRotateBy(-90)}
+          className="px-2 py-1 text-[11px] font-medium rounded bg-slate-700 hover:bg-slate-600 text-slate-200"
+          title="Rotate -90°"
+        >
+          -90°
+        </button>
+        <button
+          type="button"
+          onClick={() => onRotateBy(90)}
+          className="px-2 py-1 text-[11px] font-medium rounded bg-slate-700 hover:bg-slate-600 text-slate-200"
+          title="Rotate +90°"
+        >
+          +90°
+        </button>
+        <span className="text-[10px] text-slate-500 ml-1">by</span>
+        <NumInput
+          value={0}
+          onCommit={(v) => v && onRotateBy(v)}
+          className="w-16 px-2 py-1 bg-slate-700 rounded text-slate-100 font-mono text-right text-[11px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+        />
+        <span className="text-[10px] text-slate-500">°</span>
+      </div>
+    </div>
+  );
+}
+
 function ShapeProperties({
   shape,
   onChange,
   onOffset,
   onSetField,
   onUnlockField,
+  onRotateBy,
   lockedFields,
 }: {
   shape: Shape;
@@ -4971,6 +5556,10 @@ function ShapeProperties({
    *  Sketcher can auto-create a constraint that locks the value. */
   onSetField?: (field: string, value: number) => void;
   onUnlockField?: (field: string) => void;
+  /** Rotate the shape in place by `deltaRad` radians around its
+   *  centroid. Only used by line / polyline / arc panels — rect /
+   *  rounded-rect have an explicit `angle` field instead. */
+  onRotateBy?: (deltaRad: number) => void;
   lockedFields?: ReadonlySet<string>;
 }) {
   // Each NumField commits via setField (auto-lock) when available, falling
@@ -4999,6 +5588,7 @@ function ShapeProperties({
     );
   };
   if (shape.type === 'rect') {
+    const angleDeg = ((shape.angle ?? 0) * 180) / Math.PI;
     return (
       <div className="space-y-3">
         <div className="text-[11px] font-bold uppercase tracking-wider text-blue-400">Rectangle</div>
@@ -5008,6 +5598,11 @@ function ShapeProperties({
           {numField('Y', 'y', shape.y, (v) => onChange({ y: v }))}
           {numField('Width', 'width', shape.width, (v) => onChange({ width: Math.max(0, v) }))}
           {numField('Height', 'height', shape.height, (v) => onChange({ height: Math.max(0, v) }))}
+          <NumField
+            label="Rotation°"
+            value={angleDeg}
+            onChange={(v) => onChange({ angle: (v * Math.PI) / 180 })}
+          />
         </div>
         {onOffset && <InsetOutsetTool onApply={onOffset} />}
       </div>
@@ -5015,6 +5610,7 @@ function ShapeProperties({
   }
   if (shape.type === 'rounded-rect') {
     const capR = Math.min(shape.width, shape.height) / 2;
+    const angleDeg = ((shape.angle ?? 0) * 180) / Math.PI;
     return (
       <div className="space-y-3">
         <div className="text-[11px] font-bold uppercase tracking-wider text-blue-400">Rounded Rectangle</div>
@@ -5027,6 +5623,11 @@ function ShapeProperties({
           {numField('Radius', 'cornerRadius', shape.cornerRadius, (v) =>
             onChange({ cornerRadius: Math.max(0, Math.min(v, capR)) })
           )}
+          <NumField
+            label="Rotation°"
+            value={angleDeg}
+            onChange={(v) => onChange({ angle: (v * Math.PI) / 180 })}
+          />
         </div>
         {onOffset && <InsetOutsetTool onApply={onOffset} />}
       </div>
@@ -5058,6 +5659,9 @@ function ShapeProperties({
             className="w-4 h-4 accent-blue-500"
           />
         </label>
+        {onRotateBy && (
+          <RotateControl onRotateBy={(deg) => onRotateBy((deg * Math.PI) / 180)} />
+        )}
       </div>
     );
   }
@@ -5088,6 +5692,9 @@ function ShapeProperties({
           <span>Length</span>
           <span className="font-mono text-slate-300">{len.toFixed(2)} mm</span>
         </div>
+        {onRotateBy && (
+          <RotateControl onRotateBy={(deg) => onRotateBy((deg * Math.PI) / 180)} />
+        )}
       </div>
     );
   }
@@ -5136,6 +5743,9 @@ function ShapeProperties({
         ))}
       </div>
       {shape.closed && onOffset && <InsetOutsetTool onApply={onOffset} />}
+      {onRotateBy && (
+        <RotateControl onRotateBy={(deg) => onRotateBy((deg * Math.PI) / 180)} />
+      )}
     </div>
   );
 }

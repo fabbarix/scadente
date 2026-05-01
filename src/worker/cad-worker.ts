@@ -5,6 +5,9 @@ import {
   draw,
   Plane,
   measureShapeVolumeProperties,
+  genericSweep,
+  Wire,
+  EdgeFinder,
 } from "replicad";
 import initOpenCascade from "replicad-opencascadejs/src/replicad_single.js";
 import opencascadeWasm from "replicad-opencascadejs/src/replicad_single.wasm?url";
@@ -316,20 +319,41 @@ const computeEdgeMeta = (edges: any): Record<number, EdgeMetaPayload> => {
   if (!groups.length || !lines.length) return meta;
   for (const g of groups) {
     if (!g.count) continue;
-    // Pick a sampled vertex that's actually ON the edge. The previous
-    // implementation averaged all sampled points — fine for straight edges
-    // (the average IS on the segment) but wrong for curves: the centroid
-    // of a full circle's samples is the circle's CENTER, which is off the
-    // edge, so `edge.containsPoint(midpoint)` later misses for fillet /
-    // chamfer. The middle vertex of the polyline is always on the edge.
-    const midIdx = g.start + Math.floor(g.count / 2);
+    // Pick a point that's actually ON the edge AND in its interior — not
+    // at an endpoint. Endpoints are shared with adjacent edges, so any
+    // EdgeFinder.containsPoint(endpoint) lookup later would resolve to
+    // whichever edge the finder visits first instead of the one the user
+    // actually picked.
+    //
+    //   - count === 2 (straight edge, one segment): interpolate the two
+    //     endpoints to land on the geometric midpoint, which is strictly
+    //     inside the edge.
+    //   - count >= 3 (curve or multi-sample straight): the middle sample
+    //     is already an interior vertex (Math.floor(count / 2) is never
+    //     0 for count >= 2 once we exclude the count === 1 degenerate
+    //     case below).
+    let mx: number, my: number, mz: number;
+    if (g.count === 1) {
+      // Degenerate edge — use the single available sample.
+      const idx = g.start * 3;
+      mx = lines[idx];
+      my = lines[idx + 1];
+      mz = lines[idx + 2];
+    } else if (g.count === 2) {
+      const i0 = g.start * 3;
+      const i1 = (g.start + 1) * 3;
+      mx = (lines[i0] + lines[i1]) / 2;
+      my = (lines[i0 + 1] + lines[i1 + 1]) / 2;
+      mz = (lines[i0 + 2] + lines[i1 + 2]) / 2;
+    } else {
+      const midIdx = g.start + Math.floor(g.count / 2);
+      mx = lines[midIdx * 3];
+      my = lines[midIdx * 3 + 1];
+      mz = lines[midIdx * 3 + 2];
+    }
     meta[g.edgeId] = {
       edgeId: g.edgeId,
-      midpoint: [
-        lines[midIdx * 3],
-        lines[midIdx * 3 + 1],
-        lines[midIdx * 3 + 2],
-      ],
+      midpoint: [mx, my, mz],
       vertexStart: g.start,
       vertexCount: g.count,
     };
@@ -392,18 +416,20 @@ type OpStatus = 'ok' | 'no-effect' | 'face-missing' | 'invalid';
 const BBOX_EPS_MM = 0.1;
 
 const validateFilletResult = (before: any, after: any): boolean => {
-  if (!after || !before) return false;
-  // Volume sanity. We only require that the result has a positive finite
-  // volume; we don't compare to `before` because the change is
-  // geometry-dependent and any threshold has false positives.
-  try {
-    const vAfter = measureShapeVolumeProperties(after).volume;
-    if (!Number.isFinite(vAfter) || vAfter <= 0) return false;
-  } catch {
+  if (!after || !before) {
+    console.warn('validateFilletResult: missing before/after');
     return false;
   }
-  // Bounding-box containment. After's bbox must be ≤ before's bbox in
-  // every axis, with `BBOX_EPS_MM` slack for OpenCASCADE numerical noise.
+  try {
+    const vAfter = measureShapeVolumeProperties(after).volume;
+    if (!Number.isFinite(vAfter) || vAfter <= 0) {
+      console.warn('validateFilletResult: bad volume', vAfter);
+      return false;
+    }
+  } catch (e) {
+    console.warn('validateFilletResult: volume threw', e);
+    return false;
+  }
   try {
     const [minB, maxB] = before.boundingBox.bounds as [
       [number, number, number],
@@ -414,10 +440,17 @@ const validateFilletResult = (before: any, after: any): boolean => {
       [number, number, number]
     ];
     for (let i = 0; i < 3; i++) {
-      if (minA[i] < minB[i] - BBOX_EPS_MM) return false;
-      if (maxA[i] > maxB[i] + BBOX_EPS_MM) return false;
+      if (minA[i] < minB[i] - BBOX_EPS_MM) {
+        console.warn('validateFilletResult: bbox min escape axis', i, minA[i], '<', minB[i]);
+        return false;
+      }
+      if (maxA[i] > maxB[i] + BBOX_EPS_MM) {
+        console.warn('validateFilletResult: bbox max escape axis', i, maxA[i], '>', maxB[i]);
+        return false;
+      }
     }
-  } catch {
+  } catch (e) {
+    console.warn('validateFilletResult: bbox threw', e);
     return false;
   }
   return true;
@@ -431,17 +464,24 @@ interface BuildResult {
 
 const drawingFromShape = (shape: any): any => {
   if (shape.type === "rect") {
-    return drawRoundedRectangle(shape.width, shape.height).translate(shape.x, shape.y);
+    // `drawRoundedRectangle` builds the rect centered at (0, 0). Apply
+    // rotation about the origin (which is the rect's center) BEFORE
+    // translating so the final placement matches Konva's render
+    // (rotation around the rect's center, then position).
+    const angleDeg = ((shape.angle ?? 0) * 180) / Math.PI;
+    let d: any = drawRoundedRectangle(shape.width, shape.height);
+    if (Math.abs(angleDeg) > 1e-9) d = d.rotate(angleDeg);
+    return d.translate(shape.x, shape.y);
   }
   if (shape.type === "rounded-rect") {
     const r = Math.max(
       0,
       Math.min(shape.cornerRadius ?? 0, Math.min(shape.width, shape.height) / 2)
     );
-    return drawRoundedRectangle(shape.width, shape.height, r).translate(
-      shape.x,
-      shape.y
-    );
+    const angleDeg = ((shape.angle ?? 0) * 180) / Math.PI;
+    let d: any = drawRoundedRectangle(shape.width, shape.height, r);
+    if (Math.abs(angleDeg) > 1e-9) d = d.rotate(angleDeg);
+    return d.translate(shape.x, shape.y);
   }
   if (shape.type === "circle") {
     return drawCircle(shape.radius).translate(shape.x, shape.y);
@@ -525,6 +565,180 @@ const buildShapes = (
   return result;
 };
 
+/**
+ * Build the swept solid for a `sweep` op: re-resolve the live edge on the
+ * running model by midpoint, derive the perpendicular sketch plane from the
+ * edge tangent + stored upHint, draw the profile on that plane, and call
+ * `genericSweep(profile.wire, spineWire, …)`. Profiles are composed in
+ * declaration order using the same add/subtract semantics as `buildShapes`,
+ * but the first additive piece is the seed of the swept solid that gets
+ * fused into the running model afterward (or cut from it for `mode='subtract'`).
+ *
+ * v1 sweeps the whole edge — start/end trim handles will arrive in a
+ * follow-up that taps into BRep_Tool.Curve_2 + BRepBuilderAPI_MakeEdge_25.
+ */
+type SweepBuildResult = {
+  shape: any | null;
+  reason?: 'edge-missing' | 'invalid-sweep' | 'no-profile';
+};
+
+const buildSweepShape = (op: any, model: any): SweepBuildResult => {
+  if (!model) return { shape: null, reason: 'no-profile' };
+  const anchor = op.params?.edgeAnchor;
+  const upHint: [number, number, number] | undefined = op.params?.upHint;
+  const shapes: any[] = op.params?.shapes ?? [];
+  if (!anchor?.midpoint || !shapes.length) {
+    return { shape: null, reason: 'no-profile' };
+  }
+  // 1. Find the live Edge whose curve passes through the stored midpoint.
+  //    `containsPoint` lives on `EdgeFinder` (a chainable filter builder),
+  //    not on `Edge` itself — direct iteration over `model.edges` would
+  //    have no way to test point-on-edge. The finder pattern matches what
+  //    `model.fillet(filter)` does internally.
+  //
+  //    Anchor midpoints are stored at the edge's geometric interior so
+  //    they typically match exactly one edge, but corners shared by
+  //    multiple edges (or degenerate cases) can return more than one. We
+  //    disambiguate using `tangentHint` captured at pick time: prefer the
+  //    edge whose curve direction at the matching point most closely
+  //    aligns with the user's intent.
+  let targetEdge: any = null;
+  try {
+    const finder = new EdgeFinder().containsPoint(anchor.midpoint);
+    const matches = finder.find(model);
+    const list = Array.isArray(matches) ? matches : matches ? [matches] : [];
+    if (list.length === 1) {
+      targetEdge = list[0];
+    } else if (list.length > 1) {
+      const hint: [number, number, number] | undefined = anchor.tangentHint;
+      if (hint) {
+        let bestDot = -Infinity;
+        for (const e of list) {
+          try {
+            const adapt = new oc.BRepAdaptor_Curve_2(e.wrapped);
+            const u0 = adapt.FirstParameter();
+            const u1 = adapt.LastParameter();
+            const eps = Math.max(1e-6, (u1 - u0) * 1e-3);
+            const a = adapt.Value(u0);
+            const b = adapt.Value(u0 + eps);
+            const tx = b.X() - a.X();
+            const ty = b.Y() - a.Y();
+            const tz = b.Z() - a.Z();
+            const tlen = Math.hypot(tx, ty, tz) || 1;
+            const dot =
+              Math.abs(
+                (tx / tlen) * hint[0] +
+                  (ty / tlen) * hint[1] +
+                  (tz / tlen) * hint[2]
+              );
+            if (dot > bestDot) {
+              bestDot = dot;
+              targetEdge = e;
+            }
+          } catch {
+            // skip degenerate
+          }
+        }
+      }
+      if (!targetEdge) targetEdge = list[0];
+    }
+  } catch (e) {
+    console.error("Sweep edge lookup error:", e);
+  }
+  if (!targetEdge) return { shape: null, reason: 'edge-missing' };
+  // 2. Build a replicad Wire wrapping the OCCT TopoDS_Wire so
+  //    `genericSweep` can read `.wrapped`. Constructing `new Wire(topoDS)`
+  //    is the same pattern replicad's own helpers (e.g. makeHelix) use.
+  let spineWire: any;
+  try {
+    const topoDSWire = new oc.BRepBuilderAPI_MakeWire_2(
+      targetEdge.wrapped
+    ).Wire();
+    spineWire = new Wire(topoDSWire);
+  } catch (e) {
+    console.error("Sweep spine wire error:", e);
+    return { shape: null, reason: 'invalid-sweep' };
+  }
+  // 3. Derive the sketch plane from the edge's start tangent. We use a
+  //    small chord (BRepAdaptor_Curve.Value at FirstParameter and at
+  //    FirstParameter + epsilon) to compute the local tangent direction.
+  let plane: any;
+  try {
+    const adaptor = new oc.BRepAdaptor_Curve_2(targetEdge.wrapped);
+    const u0 = adaptor.FirstParameter();
+    const u1 = adaptor.LastParameter();
+    const eps = Math.max(1e-6, (u1 - u0) * 1e-4);
+    const p0 = adaptor.Value(u0);
+    const p1 = adaptor.Value(u0 + eps);
+    const origin: [number, number, number] = [p0.X(), p0.Y(), p0.Z()];
+    const dx = p1.X() - p0.X();
+    const dy = p1.Y() - p0.Y();
+    const dz = p1.Z() - p0.Z();
+    const tlen = Math.hypot(dx, dy, dz);
+    if (tlen < 1e-9) return { shape: null, reason: 'invalid-sweep' };
+    const tangent: [number, number, number] = [dx / tlen, dy / tlen, dz / tlen];
+    // Project upHint onto the perpendicular plane.
+    const up: [number, number, number] = upHint ?? (
+      Math.abs(tangent[2]) > 0.95 ? [0, 1, 0] : [0, 0, 1]
+    );
+    const dot =
+      up[0] * tangent[0] + up[1] * tangent[1] + up[2] * tangent[2];
+    let xx = up[0] - dot * tangent[0];
+    let xy = up[1] - dot * tangent[1];
+    let xz = up[2] - dot * tangent[2];
+    let xlen = Math.hypot(xx, xy, xz);
+    if (xlen < 1e-6) {
+      const fb: [number, number, number] =
+        Math.abs(tangent[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+      const d2 = fb[0] * tangent[0] + fb[1] * tangent[1] + fb[2] * tangent[2];
+      xx = fb[0] - d2 * tangent[0];
+      xy = fb[1] - d2 * tangent[1];
+      xz = fb[2] - d2 * tangent[2];
+      xlen = Math.hypot(xx, xy, xz);
+    }
+    const xDir: [number, number, number] = [xx / xlen, xy / xlen, xz / xlen];
+    plane = new Plane(origin, xDir, tangent);
+  } catch (e) {
+    console.error("Sweep plane derivation error:", e);
+    return { shape: null, reason: 'invalid-sweep' };
+  }
+  // 4. Build the swept profile(s). Each closed shape gets its own sweep,
+  //    composed in declaration order — same add/subtract semantics as
+  //    `buildShapes`.
+  let result: any = null;
+  for (const shape of shapes) {
+    const drawing = drawingFromShape(shape);
+    if (!drawing) continue;
+    let solid: any;
+    try {
+      const sketch = drawing.sketchOnPlane(plane);
+      solid = genericSweep(sketch.wire, spineWire, {
+        forceProfileSpineOthogonality: true,
+        transitionMode: "right",
+      } as any);
+    } catch (e) {
+      console.error("Sweep error for shape:", e);
+      continue;
+    }
+    const isSubtract = shape.operation === "subtract";
+    if (!result) {
+      if (isSubtract) continue;
+      result = solid;
+      continue;
+    }
+    try {
+      result = isSubtract ? result.cut(solid) : result.fuse(solid);
+    } catch (e) {
+      console.error(
+        `Sweep profile ${isSubtract ? "cut" : "fuse"} error:`,
+        e
+      );
+    }
+  }
+  if (!result) return { shape: null, reason: 'invalid-sweep' };
+  return { shape: result };
+};
+
 // Per-op cache entry: the running model AFTER processing this op, plus the
 // ghost payload it produced (for sketch_extrude ops). Lets a depth-only edit
 // reuse all earlier ops' models without re-running their booleans / meshing.
@@ -576,38 +790,80 @@ const buildModel = (
     let opSketch: SketchGhostPayload | null = null;
     let opStatus: OpStatus = 'ok';
     if (op.type === "fillet" || op.type === "chamfer") {
-      // Track whether ANY edge actually changed. If none did (no model yet,
-      // or every edge predicate matched zero edges), the op is a no-op.
-      // If an edge produced an invalid solid (radius too large), revert
-      // that edge and flag the op so the sidebar can warn the user.
+      // Apply all edges in ONE fillet/chamfer call. Per-edge calls broke
+      // corners: each call modifies the topology, so the next edge's
+      // `containsPoint` predicate matched post-fillet geometry, and
+      // corner-meeting fillets routinely produced invalid solids that
+      // the validator then rejected. OpenCASCADE handles multiple
+      // intersecting fillets together far more reliably than
+      // sequentially.
+      //
+      // If the batch fails (one of the radii is too big somewhere), fall
+      // back to per-edge processing so partial success is still
+      // possible. The op gets the `'invalid'` warning whenever at least
+      // one edge couldn't be filleted; if the batch path succeeded for
+      // everyone, no warning fires.
       const before = model;
-      let anyInvalid = false;
-      if (model && Array.isArray(op.params.edgePoints)) {
+      let failedEdges = 0;
+      if (
+        model &&
+        Array.isArray(op.params.edgePoints) &&
+        op.params.edgePoints.length
+      ) {
         const value =
           op.type === "fillet" ? op.params.radius : op.params.distance;
+        const edgePoints: [number, number, number][] = op.params.edgePoints;
         if (typeof value === "number" && value > 0) {
-          for (const pt of op.params.edgePoints) {
-            const previous = model;
-            try {
-              const next =
-                op.type === "fillet"
-                  ? model.fillet(value, (e: any) => e.containsPoint(pt))
-                  : model.chamfer(value, (e: any) => e.containsPoint(pt));
-              if (validateFilletResult(previous, next)) {
-                model = next;
-              } else {
-                // Bad result — keep the prior model. The radius is too
-                // large for the local geometry at this edge.
-                anyInvalid = true;
+          // Replicad's filter argument is an EdgeFinder builder, not a
+          // boolean predicate: each call (e.g. `containsPoint`) returns a
+          // configured finder rather than true/false. `EdgeFinder.either`
+          // takes an array of builder fns and ORs them together — exactly
+          // what we need to match any of the selected edges in one go.
+          const filter = (e: any) =>
+            e.either(edgePoints.map((pt) => (f: any) => f.containsPoint(pt)));
+          let batched: any = null;
+          try {
+            batched =
+              op.type === "fillet"
+                ? model.fillet(value, filter)
+                : model.chamfer(value, filter);
+          } catch (e) {
+            console.error(`${op.type} batch error:`, e);
+          }
+          if (batched && validateFilletResult(model, batched)) {
+            model = batched;
+          } else {
+            if (batched) {
+              // Batch returned a solid but the validator rejected it.
+              // Surface this so we don't fall back silently when the
+              // batch path actually worked at the OCCT level.
+              console.warn(
+                `${op.type} batch validation rejected the result; falling back to per-edge`
+              );
+            }
+            // Batch produced no valid result — try edges one at a time.
+            // Each individual success still applies; failures count.
+            for (const pt of edgePoints) {
+              const previous = model;
+              try {
+                const next =
+                  op.type === "fillet"
+                    ? model.fillet(value, (e: any) => e.containsPoint(pt))
+                    : model.chamfer(value, (e: any) => e.containsPoint(pt));
+                if (validateFilletResult(previous, next)) {
+                  model = next;
+                } else {
+                  failedEdges++;
+                }
+              } catch (e) {
+                console.error(`${op.type} per-edge error:`, e);
+                failedEdges++;
               }
-            } catch (e) {
-              console.error(`${op.type} error:`, e);
-              anyInvalid = true;
             }
           }
         }
       }
-      if (anyInvalid) opStatus = 'invalid';
+      if (failedEdges > 0) opStatus = 'invalid';
       else if (model === before) opStatus = 'no-effect';
       entries.push({ model, sketch: null, status: opStatus });
       continue;
@@ -703,11 +959,22 @@ const buildModel = (
       if (Math.abs(depth) > 1e-6) {
         currentShape = buildShapes(op.params.shapes, sketchPlane, extrudeDepth);
       }
+    } else if (op.type === "sweep") {
+      const sweepResult = buildSweepShape(op, model);
+      currentShape = sweepResult.shape;
+      if (!currentShape && model) {
+        opStatus = sweepResult.reason === 'edge-missing'
+          ? 'face-missing'   // reuse the existing badge — user reads it as "anchor lost"
+          : sweepResult.reason === 'invalid-sweep'
+            ? 'invalid'
+            : 'no-effect';
+      }
     }
 
     if (currentShape) {
       const isPocket =
-        op.type === "sketch_extrude" && op.params.mode === "pocket";
+        (op.type === "sketch_extrude" && op.params.mode === "pocket") ||
+        (op.type === "sweep" && op.params.mode === "subtract");
       if (isPocket) {
         // Pockets cut from the running model. With no model yet they're a
         // no-op — the cut shape was built but had nothing to cut into.
