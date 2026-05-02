@@ -26,6 +26,8 @@ import {
   Info,
   Maximize,
   Minimize,
+  Pin,
+  PinOff,
 } from 'lucide-react';
 import { solve, canCreate, arity, constraintResiduals, RESIDUAL_TOL } from './sketcher/constraints';
 import type { Constraint, ConstraintType, EntityRef } from './sketcher/constraints';
@@ -917,6 +919,26 @@ export function Sketcher({
     y: size.h / 2 + view.panY - p.y * screenScale,
   });
   const [tool, setTool] = useState<Tool>('select');
+  // Sticky tools: when on, the active drawing / constraint tool stays armed
+  // after each use so the user can chain multiple shapes / constraints. When
+  // off, the tool reverts to `select` after a single use. Persisted in
+  // localStorage so the preference survives reloads. Defaults to on
+  // (pre-toggle behavior).
+  const [stickyTools, setStickyTools] = useState<boolean>(() => {
+    try {
+      const v = localStorage.getItem('scadente.sketcher.stickyTools');
+      return v === null ? true : v === 'true';
+    } catch {
+      return true;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem('scadente.sketcher.stickyTools', String(stickyTools));
+    } catch {
+      // localStorage may be unavailable (private mode, sandboxed iframe) — ignore.
+    }
+  }, [stickyTools]);
   const [panelTab, setPanelTab] = useState<'properties' | 'constraints'>(
     'properties'
   );
@@ -1656,6 +1678,15 @@ export function Sketcher({
     setTool('select');
   };
 
+  // After a constraint is finalized, clear the per-pick state. With sticky
+  // tools on, the constraint type stays armed so the user can chain more.
+  // Without it, also drop the pendingConstraint so the toolbar reverts.
+  const endConstraintTurn = () => {
+    setPendingRefs([]);
+    setPendingHover(null);
+    if (!stickyTools) setPendingConstraint(null);
+  };
+
   const newConstraintId = () =>
     'c_' + Math.random().toString(36).slice(2, 11);
 
@@ -1723,10 +1754,7 @@ export function Sketcher({
             [next]
           );
           setConstraints((p) => [...p, next!]);
-          // Sticky tool: keep `pendingConstraint` set so the user can
-          // chain more H/V constraints. ESC or another tool clears it.
-          setPendingRefs([]);
-          setPendingHover(null);
+          endConstraintTurn();
           return;
         }
       } else {
@@ -1761,10 +1789,7 @@ export function Sketcher({
           [next]
         );
         setConstraints((p) => [...p, next!]);
-        // Sticky tool: keep pendingConstraint set; ESC or different
-        // toolbar pick exits.
-        setPendingRefs([]);
-        setPendingHover(null);
+        endConstraintTurn();
         return;
       }
     } else if (type === 'tangent') {
@@ -1804,9 +1829,7 @@ export function Sketcher({
             setConstraints(all);
             constraintsRef.current = all;
             applyShapes((p) => p);
-            // Sticky tool — see other branches for the rationale.
-            setPendingRefs([]);
-            setPendingHover(null);
+            endConstraintTurn();
             return;
           }
         }
@@ -1869,11 +1892,7 @@ export function Sketcher({
       // Re-solve the current shapes against the new constraint set.
       applyShapes((p) => p, [next]);
     }
-    // Sticky tool: keep `pendingConstraint` set so the user can chain
-    // multiple constraints. ESC or selecting a different toolbar button
-    // exits — both already handled by the existing keyboard / button logic.
-    setPendingRefs([]);
-    setPendingHover(null);
+    endConstraintTurn();
   };
 
   const nearestRectEdge = (
@@ -2521,8 +2540,10 @@ export function Sketcher({
     setShapes((prev) => [...prev, { id, type: 'polyline', points, closed, operation: 'add' }]);
     setPolyDraft(null);
     setSelectedId(id);
-    // Sticky tool: stay on the polyline tool so the user can draw
-    // another. Esc or picking a different tool exits.
+    // Sticky tool (when enabled): stay on the polyline tool so the user can
+    // draw another. Esc or picking a different tool exits. With stickyTools
+    // off, fall back to select after each completed polyline.
+    if (!stickyTools) setTool('select');
   };
 
   // ---- Pan / zoom ----
@@ -2857,6 +2878,7 @@ export function Sketcher({
         setArcDraft(null);
         setArcCursor(null);
         draftSnapRefsRef.current = {};
+        if (!stickyTools) setTool('select');
       }
       return;
     }
@@ -3123,9 +3145,11 @@ export function Sketcher({
         setShapes((prev) => [...prev, s]);
       }
       setSelectedId(s.id);
-      // Sticky tool: stay on the active drawing tool so the user can
-      // draw another of the same kind. Esc or picking a different tool
-      // exits back to select.
+      // Sticky tool (when enabled): stay on the active drawing tool so the
+      // user can draw another of the same kind. Esc or picking a different
+      // tool exits. With stickyTools off, fall back to select after each
+      // completed shape.
+      if (!stickyTools) setTool('select');
     }
     setDraft(null);
     draftSnapRefsRef.current = {};
@@ -5188,6 +5212,22 @@ export function Sketcher({
                 title="Reset view"
               >
                 reset view
+              </button>
+              <button
+                onClick={() => setStickyTools((v) => !v)}
+                className={`px-2 py-1 rounded border flex items-center gap-1 transition-colors ${
+                  stickyTools
+                    ? 'bg-blue-900/40 hover:bg-blue-900/60 border-blue-800/60 text-blue-200'
+                    : 'bg-slate-800/70 hover:bg-slate-700 border-slate-700 text-slate-400'
+                }`}
+                title={
+                  stickyTools
+                    ? 'Sticky tools: ON — drawing / constraint tools stay active for chained use. Click to disable.'
+                    : 'Sticky tools: OFF — tools revert to select after one use. Click to enable.'
+                }
+              >
+                {stickyTools ? <Pin size={11} /> : <PinOff size={11} />}
+                sticky {stickyTools ? 'on' : 'off'}
               </button>
               <div className="text-slate-500/80">middle-drag pan · wheel zoom</div>
             </div>
