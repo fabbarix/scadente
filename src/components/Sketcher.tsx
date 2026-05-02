@@ -829,6 +829,9 @@ export function Sketcher({
       for (const s of candidate) {
         if (s.type === 'line' && s.frozen) lockedIds.add(s.id);
       }
+      if (resizeLockedShapeIdRef.current) {
+        lockedIds.add(resizeLockedShapeIdRef.current);
+      }
       const result = solve(candidate, all, lockedIds);
       lastSolveRef.current = {
         converged: result.converged,
@@ -999,6 +1002,14 @@ export function Sketcher({
   const arcDragSnapRef = useRef<{ start: Pt; mid: Pt; end: Pt } | null>(null);
   const circleDragCenterRef = useRef<Pt | null>(null);
   const rrRadiusTLRef = useRef<Pt | null>(null);
+  // Shape currently being resized via a corner / radius / arc handle. The
+  // user is dictating that shape's dimensions, so the solver must NOT push
+  // back on its parameters during the drag — otherwise the dragged corner
+  // ends up behind the cursor by a varying amount and tracking looks
+  // sluggish or sped-up. Body drag uses a different flow (dragBoundFunc +
+  // constrainBodyDrag) and intentionally lets the solver constrain the
+  // position, so this lock only applies to applyShapes calls.
+  const resizeLockedShapeIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -3690,6 +3701,7 @@ export function Sketcher({
           arcDragSnapRef.current = null;
           circleDragCenterRef.current = null;
           rrRadiusTLRef.current = null;
+          resizeLockedShapeIdRef.current = null;
           setSnapHint(null);
         }}
       />
@@ -3736,6 +3748,7 @@ export function Sketcher({
           },
           () => {
             cornerDragOppRef.current = rotatePoint(opps[c.key], center, angle);
+            resizeLockedShapeIdRef.current = s.id;
           }
         );
       });
@@ -3775,6 +3788,7 @@ export function Sketcher({
           },
           () => {
             cornerDragOppRef.current = rotatePoint(opps[c.key], center, angle);
+            resizeLockedShapeIdRef.current = s.id;
           }
         );
       });
@@ -3801,6 +3815,7 @@ export function Sketcher({
         },
         () => {
           rrRadiusTLRef.current = tlWorld;
+          resizeLockedShapeIdRef.current = s.id;
         }
       );
       return [...cornerHandles, radiusHandle];
@@ -3826,6 +3841,7 @@ export function Sketcher({
           },
           () => {
             circleDragCenterRef.current = { x: s.cx, y: s.cy };
+            resizeLockedShapeIdRef.current = s.id;
           }
         )
       );
@@ -3860,6 +3876,7 @@ export function Sketcher({
       // substitute the cursor for the dragged one.
       const snapStart = () => {
         arcDragSnapRef.current = { start: startPt, mid: midPt, end: endPt };
+        resizeLockedShapeIdRef.current = s.id;
       };
       const snap = () => arcDragSnapRef.current ?? { start: startPt, mid: midPt, end: endPt };
       return [
