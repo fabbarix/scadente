@@ -2493,6 +2493,122 @@ export function Sketcher({
   };
 
   // ---- Pan / zoom ----
+  // ---- Touch gestures ----
+  // Two-finger gestures for iPad: pinch zooms (anchored at the centroid of
+  // the two fingers, same math as the wheel-zoom path) and the centroid's
+  // translation pans the view. Single-touch (and Apple Pencil, which fires
+  // pointerType === 'pen') still goes through the existing pointer-event
+  // pipeline for drawing. While a multi-touch gesture is in flight,
+  // `isGesturingRef.current` is true and the regular pointer handlers
+  // bail early so we don't accidentally start a draft mid-pinch.
+  const isGesturingRef = useRef(false);
+  // Mirror of the latest view so the touchmove handler can read it
+  // synchronously without re-binding listeners on every render.
+  const viewRef = useRef(view);
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const touches = new Map<
+      number,
+      { x: number; y: number }
+    >();
+    let pinchStart: {
+      dist: number;
+      cx: number;
+      cy: number;
+      view: { panX: number; panY: number; zoom: number };
+    } | null = null;
+
+    const localCoords = (clientX: number, clientY: number) => {
+      const rect = el.getBoundingClientRect();
+      return { x: clientX - rect.left, y: clientY - rect.top };
+    };
+
+    const onTouchStart = (e: TouchEvent) => {
+      for (const t of Array.from(e.changedTouches)) {
+        const p = localCoords(t.clientX, t.clientY);
+        touches.set(t.identifier, p);
+      }
+      if (touches.size >= 2) {
+        const arr = Array.from(touches.values()).slice(0, 2);
+        const dx = arr[1].x - arr[0].x;
+        const dy = arr[1].y - arr[0].y;
+        pinchStart = {
+          dist: Math.hypot(dx, dy) || 1,
+          cx: (arr[0].x + arr[1].x) / 2,
+          cy: (arr[0].y + arr[1].y) / 2,
+          view: { ...viewRef.current },
+        };
+        isGesturingRef.current = true;
+        // Cancel any draft / panning that started on the first finger.
+        setDraft(null);
+        isPanningRef.current = false;
+        panStartRef.current = null;
+        e.preventDefault();
+      }
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      let updated = false;
+      for (const t of Array.from(e.changedTouches)) {
+        if (touches.has(t.identifier)) {
+          touches.set(t.identifier, localCoords(t.clientX, t.clientY));
+          updated = true;
+        }
+      }
+      if (touches.size >= 2 && pinchStart && updated) {
+        const arr = Array.from(touches.values()).slice(0, 2);
+        const dx = arr[1].x - arr[0].x;
+        const dy = arr[1].y - arr[0].y;
+        const dist = Math.hypot(dx, dy) || 1;
+        const cx = (arr[0].x + arr[1].x) / 2;
+        const cy = (arr[0].y + arr[1].y) / 2;
+        const k = dist / pinchStart.dist;
+        const newZoom = Math.max(
+          MIN_ZOOM,
+          Math.min(MAX_ZOOM, pinchStart.view.zoom * k)
+        );
+        // World point under the original centroid — should stay put under
+        // the moving centroid, exactly like the wheel-zoom anchor math.
+        const wx =
+          (pinchStart.cx - size.w / 2 - pinchStart.view.panX) /
+          (PX_PER_MM * pinchStart.view.zoom);
+        const wy =
+          (size.h / 2 + pinchStart.view.panY - pinchStart.cy) /
+          (PX_PER_MM * pinchStart.view.zoom);
+        const newPanX = cx - size.w / 2 - wx * PX_PER_MM * newZoom;
+        const newPanY = -(size.h / 2 - cy - wy * PX_PER_MM * newZoom);
+        setView({ panX: newPanX, panY: newPanY, zoom: newZoom });
+        e.preventDefault();
+      }
+    };
+
+    const endTouch = (e: TouchEvent) => {
+      for (const t of Array.from(e.changedTouches)) touches.delete(t.identifier);
+      if (touches.size < 2) {
+        pinchStart = null;
+      }
+      if (touches.size === 0) {
+        isGesturingRef.current = false;
+      }
+    };
+
+    el.addEventListener('touchstart', onTouchStart, { passive: false });
+    el.addEventListener('touchmove', onTouchMove, { passive: false });
+    el.addEventListener('touchend', endTouch);
+    el.addEventListener('touchcancel', endTouch);
+    return () => {
+      el.removeEventListener('touchstart', onTouchStart);
+      el.removeEventListener('touchmove', onTouchMove);
+      el.removeEventListener('touchend', endTouch);
+      el.removeEventListener('touchcancel', endTouch);
+    };
+  }, [size.w, size.h]);
+
   const onWheel = (e: any) => {
     e.evt.preventDefault?.();
     const stage = e.target.getStage();
@@ -2515,6 +2631,11 @@ export function Sketcher({
   // Pencil included). iOS Safari does NOT fire mouse events for pen
   // input, so handling `onPointerDown` is required for iPad usage.
   const onPointerDown = (e: any) => {
+    // A two-finger pinch / pan is in progress on the canvas — let the
+    // gesture handler own the input. Without this guard, the second
+    // finger arriving on the canvas would start a draft (a zero-size
+    // rect, etc.) that the user has to clean up after the gesture.
+    if (isGesturingRef.current) return;
     const stage = e.target.getStage();
     // Middle-button pan (or right-button as a fallback for trackpad users)
     if (e.evt?.button === 1 || e.evt?.button === 2) {
@@ -2736,6 +2857,7 @@ export function Sketcher({
   };
 
   const onPointerMove = (e: any) => {
+    if (isGesturingRef.current) return;
     if (isPanningRef.current && panStartRef.current) {
       // Snapshot before the async setView callback runs — by the time
       // React invokes the updater, the ref may have been cleared (mouse
@@ -2905,6 +3027,13 @@ export function Sketcher({
   };
 
   const onPointerUp = () => {
+    if (isGesturingRef.current) {
+      // Reset transient state so we don't carry a half-started pan / draft
+      // into the next pointer interaction once the gesture wraps up.
+      isPanningRef.current = false;
+      panStartRef.current = null;
+      return;
+    }
     if (isPanningRef.current) {
       isPanningRef.current = false;
       panStartRef.current = null;
