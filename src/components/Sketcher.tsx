@@ -989,6 +989,16 @@ export function Sketcher({
   const containerRef = useRef<HTMLDivElement>(null);
   const isPanningRef = useRef(false);
   const panStartRef = useRef<{ cx: number; cy: number; panX: number; panY: number } | null>(null);
+  // World-space snapshots captured at handle drag-start. Read by drag
+  // callbacks instead of pulling references out of current React state —
+  // the solver mutates state mid-drag (e.g. a distance constraint between
+  // the rect center and another entity shifts `s.x` to compensate when the
+  // user resizes), and a state-derived reference would drift each frame,
+  // amplifying the cursor delta and causing the shape to grow unboundedly.
+  const cornerDragOppRef = useRef<Pt | null>(null);
+  const arcDragSnapRef = useRef<{ start: Pt; mid: Pt; end: Pt } | null>(null);
+  const circleDragCenterRef = useRef<Pt | null>(null);
+  const rrRadiusTLRef = useRef<Pt | null>(null);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -2435,36 +2445,48 @@ export function Sketcher({
       const cur = Math.hypot(dx, dy);
       if (cur > 1e-9 && v >= 0) {
         const k = v / cur;
-        updateShape(shape.id, { x2: shape.x1 + dx * k, y2: shape.y1 + dy * k });
-        // Persist as a length constraint so subsequent edits respect this value.
+        // Add the length constraint BEFORE the patched solve, otherwise
+        // applyShapes runs against constraintsRef without it and a competing
+        // constraint can revert the typed value before it ever gets pinned.
         const ref: EntityRef = { kind: 'line', shapeId: shape.id };
         upsertLengthConstraint(ref, v);
+        updateShape(shape.id, { x2: shape.x1 + dx * k, y2: shape.y1 + dy * k });
       }
     } else if (inlineEditor.kind === 'radius' && shape.type === 'circle') {
-      updateShape(shape.id, { radius: Math.max(0, v) });
-      // (radius constraint persistence comes in P3)
+      // Auto-pin the typed radius via setShapeField so a competing constraint
+      // (e.g. tangency, distance to center) can't silently revert the value.
+      setShapeField(shape, 'radius', Math.max(0, v));
     } else if (inlineEditor.kind === 'rect-width' && shape.type === 'rect') {
-      updateShape(shape.id, { width: Math.max(0, v) });
+      setShapeField(shape, 'width', Math.max(0, v));
     } else if (inlineEditor.kind === 'rect-height' && shape.type === 'rect') {
-      updateShape(shape.id, { height: Math.max(0, v) });
+      setShapeField(shape, 'height', Math.max(0, v));
     }
     setInlineEditor(null);
   };
 
   // If a length constraint already exists on this entity, update its value.
-  // Otherwise add a new one. Keeps inline-edits idempotent.
+  // Otherwise add a new one. Keeps inline-edits idempotent. Mutates
+  // constraintsRef synchronously so a follow-up applyShapes sees the new
+  // constraint on this tick (setConstraints alone wouldn't sync the ref
+  // until React commits).
   const upsertLengthConstraint = (ref: EntityRef, value: number) => {
-    setConstraints((prev) => {
-      const existing = prev.find(
-        (c) => c.type === 'length' && sameRef(c.ref, ref)
-      );
-      if (existing) {
-        return prev.map((c) =>
-          c === existing ? ({ ...c, value } as Constraint) : c
-        );
-      }
-      return [...prev, { id: 'c_' + Math.random().toString(36).slice(2, 11), type: 'length', ref, value } as Constraint];
-    });
+    const prev = constraintsRef.current;
+    const existing = prev.find(
+      (c) => c.type === 'length' && sameRef(c.ref, ref)
+    );
+    const next: Constraint[] = existing
+      ? prev.map((c) => (c === existing ? ({ ...c, value } as Constraint) : c))
+      : [
+          ...prev,
+          {
+            id: newConstraintId(),
+            type: 'length',
+            ref,
+            value,
+          } as Constraint,
+        ];
+    setConstraints(next);
+    constraintsRef.current = next;
   };
 
   const sameRef = (a: EntityRef, b: EntityRef): boolean => {
@@ -3637,7 +3659,12 @@ export function Sketcher({
     const handleSize = HANDLE_PX / screenScale;
     const half = handleSize / 2;
 
-    const Handle = (key: string, p: Pt, onDrag: (np: Pt) => void) => (
+    const Handle = (
+      key: string,
+      p: Pt,
+      onDrag: (np: Pt) => void,
+      onStart?: () => void
+    ) => (
       <Rect
         key={key}
         x={p.x - half}
@@ -3651,13 +3678,20 @@ export function Sketcher({
         onPointerDown={(e: any) => {
           e.cancelBubble = true;
         }}
+        onDragStart={onStart}
         onDragMove={(e) => {
           const raw = { x: e.target.x() + half, y: e.target.y() + half };
           const sp = snapPoint(raw);
           e.target.position({ x: sp.x - half, y: sp.y - half });
           onDrag({ x: sp.x, y: sp.y });
         }}
-        onDragEnd={() => setSnapHint(null)}
+        onDragEnd={() => {
+          cornerDragOppRef.current = null;
+          arcDragSnapRef.current = null;
+          circleDragCenterRef.current = null;
+          rrRadiusTLRef.current = null;
+          setSnapHint(null);
+        }}
       />
     );
 
@@ -3682,16 +3716,28 @@ export function Sketcher({
       } as const;
       return corners.map((c) => {
         const world = rotatePoint(c.local, center, angle);
-        return Handle(c.key, world, (np) => {
-          // Convert world drag back to local space.
-          const localNp = rotatePoint(np, center, -angle);
-          const opp = opps[c.key];
-          const nx = Math.min(localNp.x, opp.x);
-          const ny = Math.min(localNp.y, opp.y);
-          const nw = Math.abs(localNp.x - opp.x);
-          const nh = Math.abs(localNp.y - opp.y);
-          updateShape(s.id, { x: nx, y: ny, width: nw, height: nh });
-        });
+        return Handle(
+          c.key,
+          world,
+          (np) => {
+            // Use the world-space opposite corner captured at dragStart so a
+            // mid-drag solver shift on x/y doesn't move our reference and
+            // amplify the next frame's resize.
+            const oppWorld =
+              cornerDragOppRef.current ??
+              rotatePoint(opps[c.key], center, angle);
+            const localNp = rotatePoint(np, center, -angle);
+            const localOpp = rotatePoint(oppWorld, center, -angle);
+            const nx = Math.min(localNp.x, localOpp.x);
+            const ny = Math.min(localNp.y, localOpp.y);
+            const nw = Math.abs(localNp.x - localOpp.x);
+            const nh = Math.abs(localNp.y - localOpp.y);
+            updateShape(s.id, { x: nx, y: ny, width: nw, height: nh });
+          },
+          () => {
+            cornerDragOppRef.current = rotatePoint(opps[c.key], center, angle);
+          }
+        );
       });
     }
     if (s.type === 'rounded-rect') {
@@ -3712,26 +3758,51 @@ export function Sketcher({
       const cap = Math.max(0, Math.min(s.cornerRadius, Math.min(s.width, s.height) / 2));
       const cornerHandles = corners.map((c) => {
         const world = rotatePoint(c.local, center, angle);
-        return Handle(c.key, world, (np) => {
-          const localNp = rotatePoint(np, center, -angle);
-          const opp = opps[c.key];
-          const nx = Math.min(localNp.x, opp.x);
-          const ny = Math.min(localNp.y, opp.y);
-          const nw = Math.abs(localNp.x - opp.x);
-          const nh = Math.abs(localNp.y - opp.y);
-          updateShape(s.id, { x: nx, y: ny, width: nw, height: nh });
-        });
+        return Handle(
+          c.key,
+          world,
+          (np) => {
+            const oppWorld =
+              cornerDragOppRef.current ??
+              rotatePoint(opps[c.key], center, angle);
+            const localNp = rotatePoint(np, center, -angle);
+            const localOpp = rotatePoint(oppWorld, center, -angle);
+            const nx = Math.min(localNp.x, localOpp.x);
+            const ny = Math.min(localNp.y, localOpp.y);
+            const nw = Math.abs(localNp.x - localOpp.x);
+            const nh = Math.abs(localNp.y - localOpp.y);
+            updateShape(s.id, { x: nx, y: ny, width: nw, height: nh });
+          },
+          () => {
+            cornerDragOppRef.current = rotatePoint(opps[c.key], center, angle);
+          }
+        );
       });
       // Radius control handle: drag along the (rotated) top edge from
       // the TL corner. Distance from TL along the rotated +X controls
       // cornerRadius (clamped to half the smaller side).
       const radiusHandleLocal: Pt = { x: s.x + cap, y: s.y };
       const radiusHandlePos = rotatePoint(radiusHandleLocal, center, angle);
-      const radiusHandle = Handle('rr-radius', radiusHandlePos, (np) => {
-        const localNp = rotatePoint(np, center, -angle);
-        const r = Math.max(0, Math.min(localNp.x - s.x, Math.min(s.width, s.height) / 2));
-        updateShape(s.id, { cornerRadius: r });
-      });
+      const tlWorld = rotatePoint({ x: s.x, y: s.y }, center, angle);
+      const radiusHandle = Handle(
+        'rr-radius',
+        radiusHandlePos,
+        (np) => {
+          // Anchor on the TL world position captured at dragStart so a
+          // mid-drag solver shift on s.x doesn't drift the radius reading.
+          const tl = rrRadiusTLRef.current ?? tlWorld;
+          const localNp = rotatePoint(np, center, -angle);
+          const localTL = rotatePoint(tl, center, -angle);
+          const r = Math.max(
+            0,
+            Math.min(localNp.x - localTL.x, Math.min(s.width, s.height) / 2)
+          );
+          updateShape(s.id, { cornerRadius: r });
+        },
+        () => {
+          rrRadiusTLRef.current = tlWorld;
+        }
+      );
       return [...cornerHandles, radiusHandle];
     }
     if (s.type === 'circle') {
@@ -3742,10 +3813,21 @@ export function Sketcher({
         { key: 'r-s', p: { x: s.cx, y: s.cy - s.radius } },
       ];
       return cardinals.map((d) =>
-        Handle(d.key, d.p, (np) => {
-          const r = Math.max(SNAP_MM, snap(dist({ x: s.cx, y: s.cy }, np)));
-          updateShape(s.id, { radius: r });
-        })
+        Handle(
+          d.key,
+          d.p,
+          (np) => {
+            // Anchor on the world-space center captured at dragStart so a
+            // mid-drag solver shift on (cx, cy) — e.g. via tangent or
+            // coincident constraints — doesn't drift the radius reading.
+            const c = circleDragCenterRef.current ?? { x: s.cx, y: s.cy };
+            const r = Math.max(SNAP_MM, snap(dist(c, np)));
+            updateShape(s.id, { radius: r });
+          },
+          () => {
+            circleDragCenterRef.current = { x: s.cx, y: s.cy };
+          }
+        )
       );
     }
     if (s.type === 'arc') {
@@ -3770,10 +3852,29 @@ export function Sketcher({
         const arc = arcFromThreePoints(np1, npMid, np2);
         if (arc) updateShape(s.id, arc);
       };
+      // The two non-dragged handles are the "fixed" reference. If we read
+      // them off current state each frame, a mid-drag solver shift on the
+      // arc's params (e.g. via tangent / coincident constraints on an
+      // endpoint) drifts those references and the recomputed arc compounds
+      // away from the user's intent. Snapshot all three at dragStart and
+      // substitute the cursor for the dragged one.
+      const snapStart = () => {
+        arcDragSnapRef.current = { start: startPt, mid: midPt, end: endPt };
+      };
+      const snap = () => arcDragSnapRef.current ?? { start: startPt, mid: midPt, end: endPt };
       return [
-        Handle('arc-start', startPt, (np) => recompute(np, midPt, endPt)),
-        Handle('arc-mid', midPt, (np) => recompute(startPt, np, endPt)),
-        Handle('arc-end', endPt, (np) => recompute(startPt, midPt, np)),
+        Handle('arc-start', startPt, (np) => {
+          const sn = snap();
+          recompute(np, sn.mid, sn.end);
+        }, snapStart),
+        Handle('arc-mid', midPt, (np) => {
+          const sn = snap();
+          recompute(sn.start, np, sn.end);
+        }, snapStart),
+        Handle('arc-end', endPt, (np) => {
+          const sn = snap();
+          recompute(sn.start, sn.mid, np);
+        }, snapStart),
       ];
     }
     if (s.type === 'line') {
